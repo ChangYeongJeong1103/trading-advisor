@@ -1,0 +1,56 @@
+# Environment variables
+.env
+*.env
+
+# Data and Database (Local storage)
+chroma_db/
+logs/
+*.log
+
+# Experimental data (너무 커서 GitHub에 안 올림)
+notebooks/logs/
+src/logs/
+src/chroma_db/
+src/hyperparameter_experiments.csv
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# System files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.AppleDouble
+.LSOverride
+._*
