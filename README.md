@@ -171,7 +171,6 @@ trading-advisor/
 
 *   [ ] Integrate real-time stock price API (e.g., AlphaVantage, Finnhub).
 *   [ ] Add user authentication for personalized portfolios.
-*   [ ] Deploy to Google Cloud Run (Serverless).
 
 ---
 
