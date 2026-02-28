@@ -76,7 +76,15 @@ graph TD
 
 ## Getting Started
 
-### Option 1: Run with Docker (Recommended)
+### Option 1: Try Live Demo (Cloud Deployment)
+
+**No installation required!** Access the deployed application directly:
+
+🔗 **[https://trading-advisor-961016411722.us-west2.run.app](https://trading-advisor-961016411722.us-west2.run.app)**
+
+> Deployed on Google Cloud Run for instant access.
+
+### Option 2: Run with Docker
 
 The easiest way to run the application without installing dependencies manually.
 
@@ -90,7 +98,7 @@ docker run -p 8501:8501 -e OPENAI_API_KEY="your-api-key-here" trading-advisor
 
 Visit `http://localhost:8501` in your browser.
 
-### Option 2: Run Locally
+### Option 3: Run Locally (Code-Only Clone)
 
 1.  **Clone the repository**:
     ```bash
@@ -109,18 +117,16 @@ Visit `http://localhost:8501` in your browser.
     OPENAI_API_KEY=sk-...
     ```
 
-4.  **Run the App**:
+4.  **Prepare runtime data (required)**:
+    This GitHub repository is code-only by default (both `data/` and `chroma_db/` are excluded).
+    To run locally, provide one of the following:
+    - a prebuilt `chroma_db/` folder, or
+    - source files (`.pdf` / `.docx`) under `data/` and then build `chroma_db/`.
+
+5.  **Run the App**:
     ```bash
     streamlit run src/app_streamlit.py
     ```
-
-### Option 3: Try Live Demo (Cloud Deployment)
-
-**No installation required!** Access the deployed application directly:
-
-🔗 **[https://trading-advisor-961016411722.us-west2.run.app](https://trading-advisor-961016411722.us-west2.run.app)**
-
-> Deployed on Google Cloud Run for instant access.
 
 ---
 
