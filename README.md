@@ -1,4 +1,4 @@
-# 📈 AI Stock Market Analyst (Trading Advisor)
+# AI Stock Market Analyst (Trading Advisor)
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-FF4B4B.svg)
@@ -80,7 +80,7 @@ graph TD
 
 **No installation required!** Access the deployed application directly:
 
-🔗 **[https://trading-advisor-961016411722.us-west2.run.app](https://trading-advisor-961016411722.us-west2.run.app)**
+**[https://trading-advisor-961016411722.us-west2.run.app](https://trading-advisor-961016411722.us-west2.run.app)**
 
 > Deployed on Google Cloud Run for instant access.
 
