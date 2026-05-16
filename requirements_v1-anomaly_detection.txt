@@ -1,0 +1,96 @@
+# =====================================================================
+# anomaly-daemon — requirements (Cloud Run service)
+# =====================================================================
+# This file lists the dependencies used ONLY by the anomaly detection
+# daemon. The RAG advisor (sentence-transformers, chromadb, langchain,
+# streamlit) runs in a separate Cloud Run service, so its deps are not
+# included here.
+# Splitting them keeps the daemon image at ~500 MB instead of ~15 GB.
+# =====================================================================
+
+# ---------- Async + WebSocket + HTTP ----------
+websockets              # Polymarket / Hyperliquid WebSocket subscribe
+httpx                   # async HTTP client (REST polling, Telegram bot)
+requests                # X post publisher (sync HTTP inside asyncio.to_thread)
+requests-oauthlib       # X OAuth1 signing for POST /2/tweets
+tenacity                # exponential backoff + circuit breaker (D4)
+aiohttp                 # HTTP health server for Cloud Run probe (entrypoint)
+
+# ---------- Data / storage ----------
+pandas                  # in-memory rolling window
+pyarrow                 # Parquet writer (raw_store, feature_store)
+# sqlite3 ships with the Python standard library
+
+# ---------- Validation / config ----------
+pydantic                # canonical schemas (ChannelSignal, FusedAnomalyEvent, ...)
+pydantic-settings       # .env / env var → Pydantic auto-load (config.py)
+pyyaml                  # D10 watchlist YAML
+python-dotenv           # .env file loader
+
+# ---------- External data channels ----------
+# X account polling uses only the X API v2 Bearer token (called directly
+# with httpx, no extra package required). snscrape was used historically
+# but was removed in 2026-05 after GCP IP blocking + the move to X API PAYG.
+databento               # CME GLBX.MDP3 trades historical + Live (P9.3.P3)
+dune-client             # Polymarket replay — historical trades fetch (P10 replay)
+
+# ---------- Truth Social (Channel 5 — since v0.7.18) ----------
+# The Mastodon-compatible public API is called directly with raw httpx.
+# truthbrush was evaluated but rejected:
+#   - PyPI 0.4.x requires Python 3.14+ — incompatible with our 3.11 base image
+#   - 0.3.0 requires a token (no unauthenticated mode) — does not fit our
+#     use case of pulling Trump only without auth
+#   - The w2rc fork is a single-maintainer project (external archive risk)
+# We poll Trump only, every 5min ± 60s jitter — IP-ban risk is very low.
+# No additional dependency needed (httpx is already declared above).
+
+# ---------- LLM (X channel Stage-2 classifier, P9.4) ----------
+openai                  # GPT-5.4 async client + vision + JSON mode (llm_classifier)
+
+# ---------- GCP ----------
+google-cloud-storage    # GCS bucket read (enricher) + write (streamer on VM)
+
+# ---------- Logging / observability ----------
+structlog               # JSON log → Cloud Logging auto-ingest
+
+# ---------- Notifications ----------
+# Email: standard library smtplib (no extra package required)
+# Telegram: httpx Bot API calls
+
+# ---------- Notification plot generation (P11(a/d)) ----------
+# Both channel_email and channel_telegram embed a 1h/6h timeline plot PNG
+# inline. matplotlib draws the plot; pillow handles inline image encoding
+# (MIMEImage and friends depend on it under the hood).
+# On Cloud Run's python:3.11-slim base, one extra wheel install is enough.
+matplotlib              # email/telegram 1h+6h timeline stacked plots
+pillow                  # PNG decode/encode helper (matplotlib + inline_assets)
+
+# Dev / test dependencies (pytest, etc.) are NOT shipped in the production image.
+
+
+# =====================================================================
+# cme-streamer — VM (e2-micro) only dependencies
+# =====================================================================
+# This second block lists the minimal deps installed on the GCP Compute
+# Engine VM that streams CME ticks. None of the daemon's heavier channel
+# / fusion / alert dependencies are included.
+#
+# The VM is an e2-micro (1 GB RAM, 10 GB disk), so we keep this list as
+# small as possible.
+# =====================================================================
+
+# ---------- Databento Live (WebSocket streaming) ----------
+databento               # CME GLBX.MDP3 trades live + symbol mapping
+
+# ---------- Data / storage ----------
+pandas                  # row → DataFrame → Parquet conversion
+pyarrow                 # Parquet writer (snappy)
+
+# ---------- GCP ----------
+google-cloud-storage    # GCS bucket upload (default service account auth)
+google-auth==2.30.0     # pin: 2.49+ universe-domain handling conflicts with
+                        # the GCE metadata server (HTTPS fallback → SSL cert
+                        # verify failure). 2.30 is stable.
+
+# ---------- Logging ----------
+# Standard library logging only (Cloud Logging auto-ingests stdout).

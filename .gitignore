@@ -1,19 +1,77 @@
-# Environment variables
+# ============================================================================
+# Environment variables — NEVER commit (SMTP / Telegram / OpenAI / X API keys)
+# ============================================================================
 .env
 *.env
+.env.*
+# but DO ship the template so users know which vars to set
+!.env.example
 
-# Data and Database (Local storage)
-chroma_db/
+# ============================================================================
+# Logs
+# ============================================================================
 logs/
 *.log
 
-# Experimental data (너무 커서 GitHub에 안 올림)
-notebooks/logs/
-src/logs/
+# ============================================================================
+# v0 — Market Summary (RAG / Streamlit)
+# ============================================================================
+# Chroma vector store — rebuild locally from PDFs in data/market_summary/
+chroma_db/
 src/chroma_db/
+src/market_summary/chroma_db/
 src/hyperparameter_experiments.csv
+notebooks/logs/
 
-# Python cache and compiled files
+# ============================================================================
+# v1 — Anomaly Detection runtime artifacts
+# ============================================================================
+# Only the 4 reference DBs under data/anomaly_detection/ are tracked:
+#   historical_events/   truthsocial/   polymarket_baseline/   hl_wallet/
+# All other subfolders are runtime output and excluded.
+data/anomaly_detection/raw/
+data/anomaly_detection/features/
+data/anomaly_detection/cost/
+data/anomaly_detection/signals/
+data/anomaly_detection/decisions/
+data/anomaly_detection/alert_previews/
+data/anomaly_detection/alerts_test_send/
+data/anomaly_detection/3events_burst/
+data/anomaly_detection/baseline_normal_days/
+data/anomaly_detection/replay_cache/
+data/anomaly_detection/replay_results/
+
+# SQLite runtime sidecar files (WAL / SHM) — auto-created, never commit
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# LLM embedding cache (regenerated locally)
+data/anomaly_detection/truthsocial/.cache/
+
+# One-time wayback validation reports (not part of the reference DB)
+data/anomaly_detection/truthsocial/wayback_verification.json
+data/anomaly_detection/truthsocial/wayback_verification.md
+
+# Databento downloaded ticks (hundreds of MB, paid API data)
+data/databento/
+
+# Generated email previews
+*.eml
+
+# ============================================================================
+# Cursor IDE / personal notes — NEVER commit (may contain secrets / chats)
+# ============================================================================
+cursor/
+.cursor/
+review_*.md
+
+# ============================================================================
+# Python
+# ============================================================================
 __pycache__/
 *.pyc
 *.pyo
@@ -21,36 +79,45 @@ __pycache__/
 .Python
 *.so
 
+# ============================================================================
 # Jupyter Notebook checkpoints
+# ============================================================================
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
 
-# System files
-.DS_Store
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
+# ============================================================================
 # Virtual Environment
+# ============================================================================
 venv/
 env/
 ENV/
 .venv/
+.venv-*/
 
-# Distribution / packaging
+# ============================================================================
+# Distribution / Build
+# ============================================================================
 build/
 dist/
 *.egg-info/
 .eggs/
 
+# ============================================================================
 # Testing
+# ============================================================================
 .pytest_cache/
 .coverage
 htmlcov/
 
-# macOS
+# ============================================================================
+# System files (macOS / Editors)
+# ============================================================================
+.DS_Store
 .AppleDouble
 .LSOverride
 ._*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

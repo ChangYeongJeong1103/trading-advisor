@@ -1,0 +1,101 @@
+# ====================================================================
+# Dockerfile.anomaly_detection — anomaly detection daemon (Cloud Run)
+# ====================================================================
+# A separate image from the v0 Streamlit advisor's `Dockerfile.market_summary`.
+#
+# Build:
+#   docker build -f Dockerfile.anomaly_detection -t anomaly-daemon:latest .
+# Run locally:
+#   docker run --rm -p 8080:8080 --env-file .env anomaly-daemon:latest
+# Health check:
+#   curl http://localhost:8080/health
+#
+# See docs/v1-anomaly_detection/cloud-run-deploy.md for the Cloud Run
+# deployment guide.
+# ====================================================================
+
+# ─────────────────────────────────────────────────────────────────────
+# Stage 1: builder — wheel cache
+# ─────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+
+# Build tools for C extensions (pyarrow, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# anomaly daemon requirements (RAG/Streamlit deps excluded → ~30x smaller image)
+COPY requirements_v1-anomaly_detection.txt ./
+
+# Pre-build the wheel cache so the final stage can reuse it.
+RUN pip install --upgrade pip && \
+    pip wheel --wheel-dir=/wheels -r requirements_v1-anomaly_detection.txt
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Stage 2: runtime — slim + non-root user
+# ─────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    ANOMALY_ENV=cloud_run \
+    PORT=8080 \
+    PYTHONPATH=/app/src
+
+WORKDIR /app
+
+# Minimal runtime deps (curl is for Cloud Run debugging / health checks).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install wheels from the builder cache.
+COPY --from=builder /wheels /wheels
+COPY requirements_v1-anomaly_detection.txt ./
+RUN pip install --no-index --find-links=/wheels -r requirements_v1-anomaly_detection.txt && \
+    rm -rf /wheels
+
+# App code — the v0 (Streamlit) source is intentionally NOT copied here;
+# this image is for the anomaly_detection daemon only.
+#   src/anomaly_detection/ : daemon source
+#   config/                : watchlist.yaml etc. (D10)
+#   assets/anomaly/        : 5 channel brand logos (P11(a) — inline-attached
+#                            in email + telegram). inline_assets.py reads
+#                            _REPO_ROOT/assets/anomaly/channel_logos/<ch>.png,
+#                            so the image must keep the same path layout
+#                            or production logos will break.
+COPY src/anomaly_detection/ ./src/anomaly_detection/
+COPY config/ ./config/
+COPY assets/anomaly/ ./assets/anomaly/
+
+# Data dir — /tmp is ephemeral on Cloud Run. For durable storage, mount a
+# GCS FUSE volume (see the deployment guide).
+RUN mkdir -p /tmp/anomaly-data
+ENV ANOMALY_DATA_PATH=/tmp/anomaly-data
+
+# Non-root user (security best practice).
+RUN useradd --create-home --uid 1000 anomaly && \
+    chown -R anomaly:anomaly /app /tmp/anomaly-data
+USER anomaly
+
+# Cloud Run requires listening on $PORT (default 8080).
+EXPOSE 8080
+
+# Health check — Cloud Run has its own probe; this one is for local docker runs.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+# Entry — anomaly_daemon.entrypoint() (signal handling + graceful shutdown).
+CMD ["python", "-m", "anomaly_detection.entrypoints.anomaly_daemon"]

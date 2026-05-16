@@ -1,0 +1,580 @@
+# =====================================================================
+# config/x_keywords.yaml — X (Twitter) Stage-1 keyword/regex filter
+# =====================================================================
+#
+# Purpose:
+#   Sending every X post directly to GPT-5.4 wastes cost and latency, so
+#   a fast keyword + regex filter first selects "posts that look possibly
+#   trading-relevant" and passes only those to the LLM (Stage 2).
+#
+# How matching works:
+#   We compute a score for each post:
+#
+#     score = (ticker_score + case_score + common_score + regex_score)
+#             × account_multiplier
+#             × (0 if irrelevant else 1)
+#
+#   If score >= stage1_filter_config.llm_threshold, the LLM is invoked.
+#
+#   Note: each category (e.g. case_keywords) contributes its weight at
+#   most once, even when several keywords inside it match. This prevents
+#   long posts from passing automatically.
+#
+# Matching rules:
+#   - All keywords are matched case-insensitively (compared in lowercase).
+#   - **Word-boundary matching** is used (Python `\b...\b`).
+#       e.g. searching for "short":
+#         match     "BTC short", "is short", "short position"
+#         no match  "shortage", "shortly", "short-term"
+#         no match  "shorts", "shorted"  → plural / tense variants must
+#                                           be listed explicitly.
+#   - Phrase keywords (e.g. "opened short") match the literal spacing.
+#   - regex_patterns use Python `re` syntax, compiled with IGNORECASE.
+#
+# Six-case reference (the insider-trading events used as the case study):
+#   1. 2025-04-09  Liberation Day SPY options ($24M put spread)
+#   2. 2025-10-10  Trump China 100% tariff / Hyperliquid BTC-ETH short ($1.1B)
+#   3. 2026-01-03  Maduro capture / Polymarket ($32K → $436K)
+#   4. 2026-02-28  Iran first strike / Polymarket ($500M+, Magamyman)
+#   5. 2026-03-23  Trump Truth Social Iran delay / oil short ($580M, 16 min before)
+#   6. 2026-04-17  Iran Hormuz open / Brent short ($760M, 20 min before)
+#
+# How to edit:
+#   - Add or remove keywords freely. Restart the daemon to apply
+#     (Cloud Run = image rebuild).
+#   - When a new event occurs, add a new group under `case_keywords`.
+#   - The multiplier in account_priority is a scaling factor (1.0 = no change).
+#   - All keywords are matched case-insensitively (compared in lowercase).
+#   - regex_patterns use Python `re` syntax.
+#
+# Plan: P9.4 (X channel LLM upgrade), architecture §5.4.1 channel tier
+# =====================================================================
+
+
+version: "1.0"
+last_updated: "2026-04-19"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Stage-1 filter configuration — score threshold and category weights.
+# ─────────────────────────────────────────────────────────────────────
+stage1_filter_config:
+  # ─────────────────────────────────────────────────────────────────
+  # Scoring system explanation:
+  #
+  #   This is a "score" system, not a normalized "probability"
+  #   (the sum is not constrained to 1).
+  #   Each category contributes a "this is how suspicious it is" score,
+  #   and the scores are summed.
+  #
+  #   Categories are split into two groups:
+  #
+  #     Prerequisite layer (asset identification)
+  #       ticker_match: 0.20  ← bonus: "what asset is this post about?"
+  #
+  #     Signal layer (insider patterns)
+  #       case_keyword:   0.40  ← case-specific keywords from the 6 events
+  #       common_signal:  0.30  ← timing / wallet / size common signals
+  #       regex:          0.30  ← USD amounts, timestamps, contract counts
+  #       ───────────────────
+  #       max signal = 1.00     ← signals alone can score up to 1.00
+  #
+  #   Score range:
+  #     - min   = 0.00  (no category matched, or irrelevant filter ×0)
+  #     - max   = 1.20  (ticker + all signals: 0.20+0.40+0.30+0.30)
+  #     - final = up to 1.44  (× max account_multiplier 1.20)
+  #
+  #   → It is fine for the sum to exceed 1.0; this is not a normalized
+  #     probability.
+  #
+  #   Design rationale:
+  #     - A post without a ticker is unlikely to be a real trading post,
+  #       so ticker_match acts as the default entry bonus.
+  #     - But we do NOT hard-reject ticker-less posts (rare edge case
+  #       preservation): a post with all three signals strongly present
+  #       can still pass even without a ticker.
+  #
+  #   Each category contributes its weight at most ONCE per post (long
+  #   posts cannot pass automatically by matching many synonyms).
+  # ─────────────────────────────────────────────────────────────────
+  weights:
+    ticker_match: 0.20         # asset/instrument mention (BTC, oil, ...) — prerequisite bonus
+    case_keyword_match: 0.40   # case-specific keywords (strongest signal)
+    common_signal_match: 0.30  # cross-event common signals (timing, wallet behavior)
+    regex_match: 0.30          # structured patterns (USD amount, contracts, ...)
+
+  # LLM (Stage 2) invocation threshold.
+  # Too high → false negatives (we miss insider posts).
+  # Too low  → LLM cost grows (false positives).
+  #
+  # 0.80 means:
+  #   - ticker (0.20) + two strong signal categories (0.60) = 0.80 → pass
+  #   - ticker (0.20) + one signal category only (0.30-0.40) = fail
+  #   - no ticker + all three signal categories match (1.00) = pass (rare but valid)
+  #   - i.e. "asset mention + strong patterns" or "very strong patterns alone" pass.
+  llm_threshold: 0.80
+
+  # Time to cache LLM responses (avoid re-processing the same post).
+  cache_ttl_seconds: 3600
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Asset / instrument tickers.
+# Only assets we can actually trade — other random tickers are noise.
+# ─────────────────────────────────────────────────────────────────────
+tickers_and_assets:
+  # crypto majors
+  - "btc"
+  - "bitcoin"
+  - "eth"
+  - "ethereum"
+  - "sol"
+  - "solana"
+  - "xrp"
+  - "doge"
+  - "hype"
+  # commodities
+  - "oil"
+  - "wti"
+  - "brent"
+  - "crude"
+  - "gold"
+  - "xau"
+  # equity index
+  - "spy"
+  - "spx"
+  - "s&p"
+  - "s&p 500"
+  - "es"
+  - "nasdaq"
+  - "nq"
+  - "qqq"
+  - "ndx"
+  # options / futures generic
+  - "futures"
+  - "options"
+  - "calls"
+  - "puts"
+  - "perp"
+  - "perpetual"
+  # geopolitical / event-related assets
+  - "polymarket"
+  - "kalshi"
+  - "hyperliquid"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Case-specific keywords — words that actually appeared in the X posts
+# of the six confirmed cases.
+# (Distinct from the LLM few-shot file; these are used for Stage-1 fast
+# matching only.)
+# ─────────────────────────────────────────────────────────────────────
+case_keywords:
+
+  # ── Case 1: 2025-04-09 Liberation Day SPY options ────────────────
+  liberation_day:
+    keywords:
+      - "liberation day"
+      - "spy put"
+      - "spy puts"
+      - "spy call"
+      - "spy calls"
+      - "spy 24.5m"
+      - "put spread"
+      - "tariff"
+      - "tariffs"
+      - "90-day pause"
+      - "90 day pause"
+      - "trump tariff"
+      - "trade war"
+      - "smart money"
+      - "unusual options activity"
+      - "uoa"
+      - "unusual options"
+
+  # ── Case 2: 2025-10-10 China 100% tariff / Hyperliquid whale ─────
+  china_tariff_hyperliquid:
+    keywords:
+      - "hyperliquid"
+      - "hyperliquid whale"
+      - "100% tariff"
+      - "100 percent tariff"
+      - "china tariff"
+      - "rare earth"
+      - "btc short"
+      - "eth short"
+      - "1.1b short"
+      - "1b short"
+      - "satoshi-era"
+      - "satoshi era"
+      - "bitcoin og"
+      - "btc og"
+      - "bloodbath"
+      - "cascade"
+      - "liquidation cascade"
+      - "did he have insider"
+      - "insider information"
+      - "30 minutes before"
+      - "minutes before"
+      - "10x leverage"
+      - "12x leverage"
+      - "5x leverage"
+
+  # ── Case 3: 2026-01-03 Maduro capture / Polymarket ───────────────
+  maduro_polymarket:
+    keywords:
+      - "maduro"
+      - "venezuela"
+      - "venezuelan leader"
+      - "operation absolute resolve"
+      - "burdensome-mix"
+      - "burdensome mix"
+      - "0x31a56e"
+      - "yes shares"
+      - "maduro out"
+      - "black swan"
+      - "32k turned"
+      - "$32,000 bet"
+      - "$32k bet"
+      - "$400k profit"
+      - "$436k"
+      - "freshly funded"
+      - "freshly created"
+      - "newly created wallet"
+      - "new account"
+      - "no prior history"
+      - "0 prior history"
+
+  # ── Case 4: 2026-02-28 Iran first strike / Polymarket ────────────
+  iran_first_strike:
+    keywords:
+      - "us strikes iran"
+      - "us strike iran"
+      - "magamyman"
+      - "khamenei"
+      - "wallet splitting"
+      - "93% success"
+      - "coordinated cluster"
+      - "5 days before"
+      - "polymarket yes"
+      - "yes bet"
+      - "israel strike iran"
+      - "israeli strike iran"
+      - "operation epic fury"
+      - "implied probability"
+      - "low implied"
+      - "ayatollah"
+
+  # ── Case 5: 2026-03-23 Trump Truth Social oil ────────────────────
+  trump_truthsocial_oil:
+    keywords:
+      - "productive conversation"
+      - "very good and productive"
+      - "delay attack"
+      - "delay attacks"
+      - "delay strikes"
+      - "oil futures"
+      - "wti futures"
+      - "brent futures"
+      - "6,200 contracts"
+      - "6200 contracts"
+      - "1.46b"
+      - "$1.46 billion"
+      - "15 minutes before"
+      - "15 min before"
+      - "16 minutes before"
+      - "truth social"
+      - "pause iran"
+      - "pause attack"
+      - "tag 50"
+      - "pre-tweet"
+      - "pre tweet"
+      - "ceasefire by"
+      - "abnormal volume"
+      - "abnormal activity"
+      - "abnormal betting"
+
+  # ── Case 6: 2026-04-17 Iran Hormuz open / Brent short ────────────
+  iran_hormuz:
+    keywords:
+      - "strait of hormuz"
+      - "hormuz"
+      - "7,990 lots"
+      - "7990 lots"
+      - "12:24 gmt"
+      - "12:25 gmt"
+      - "20 minutes before"
+      - "20 min before"
+      - "araghchi"
+      - "iranian foreign minister"
+      - "iran fm"
+      - "completely open"
+      - "$760m short"
+      - "760m short"
+      - "ice brent"
+      - "crude oil dump"
+      - "ceasefire"
+      - "single wallet"
+      - "$950m"
+      - "april 7 ceasefire"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Common signal keywords — signal phrases that appear across events.
+# (Markers of suspicious behavior, regardless of which case.)
+# ─────────────────────────────────────────────────────────────────────
+common_signal_keywords:
+
+  # ── Timing signals ────────────────────────────────────────────────
+  timing_signals:
+    - "minutes before"
+    - "min before"
+    - "hours before"
+    - "hrs before"
+    - "right before"
+    - "just before"
+    - "moments before"
+    - "shortly before"
+    - "precise timing"
+    - "perfect timing"
+    - "uncanny timing"
+    - "suspicious timing"
+    - "pre-announcement"
+    - "pre announcement"
+    - "before the news"
+    - "before announcement"
+    - "before the announcement"
+    - "before the post"
+    - "before the tweet"
+
+  # ── Wallet / account signals ──────────────────────────────────────
+  wallet_signals:
+    - "freshly created"
+    - "freshly funded"
+    - "newly created"
+    - "newly funded"
+    - "no prior history"
+    - "0 prior history"
+    - "new wallet"
+    - "new account"
+    - "new accounts"
+    - "first transaction"
+    - "first trade"
+    - "coordinated wallets"
+    - "cluster of wallets"
+    - "wallet cluster"
+    - "same-day funded"
+    - "same day funded"
+    - "moving in unison"
+    - "moving together"
+
+  # ── Size / scale signals ──────────────────────────────────────────
+  size_signals:
+    - "massive position"
+    - "massive short"
+    - "massive long"
+    - "massive bet"
+    - "huge short"
+    - "huge long"
+    - "huge position"
+    - "huge bet"
+    - "large position"
+    - "large short"
+    - "large bet"
+    - "whale opens"
+    - "whale opened"
+    - "whale dumps"
+    - "whale dumped"
+    - "aggressive bet"
+    - "aggressive short"
+    - "aggressive long"
+    - "leveraged short"
+    - "leveraged long"
+    - "high leverage"
+
+  # ── Analyst suspicion phrases ─────────────────────────────────────
+  suspicion_phrases:
+    - "did he have insider"
+    - "did they have insider"
+    - "insider information"
+    - "insider info"
+    - "insider trading"
+    - "insider knowledge"
+    - "insider tip"
+    - "insider tips"
+    - "lucky or leaked"
+    - "lucky or insider"
+    - "lucky whale or insider"
+    - "coincidence?"
+    - "is it a coincidence"
+    - "non-public information"
+    - "non public information"
+    - "leaked"
+    - "leak"
+    - "tipped off"
+    - "tipped-off"
+    - "eyebrows"
+    - "raise eyebrows"
+    - "raised eyebrows"
+    - "suspiciously timed"
+    - "suspicious timing"
+    - "suspicious pattern"
+    - "questionable timing"
+    - "how did he know"
+    - "how did they know"
+    - "how did she know"
+
+  # ── Action verbs (smart-money behavior) ───────────────────────────
+  # NOTE: matching uses word boundaries (\b...\b), so plural / tense
+  #       variants (short → shorts, shorted, shorting) must be listed
+  #       explicitly. This keeps the matcher deterministic and easy to
+  #       audit ("why did this keyword fire?" is obvious).
+  action_verbs:
+    # Position (the single most common trading-context word)
+    - "short"
+    - "shorts"
+    - "shorted"
+    - "shorting"
+    - "long"          # caveat: "long time" is a possible false positive
+    - "longs"
+    - "longed"
+    - "longing"
+
+    # Buy / Sell — too generic on their own; only phrase / inflected forms here
+    - "buys"          # "Whale buys X" — subject + noun pattern
+    - "sells"
+    - "bought"
+    - "sold"
+
+    # Position actions
+    - "opened short"
+    - "opened long"
+    - "opened a short"
+    - "opened a long"
+    - "closed short"
+    - "closed long"
+    - "closed his short"
+    - "closed her short"
+    - "closed their short"
+
+    # On-chain actions
+    - "deposited"
+    - "withdrew"
+    - "withdrawn"
+    - "dumped"
+    - "dumping"
+    - "loaded up"
+    - "loading up"
+    - "stacked"
+    - "stacking shorts"
+    - "stacking longs"
+    - "scaled in"
+    - "scaling in"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Regex patterns — structured matching (numbers, times, addresses).
+# Python `re` syntax. Compiled case-insensitively.
+# ─────────────────────────────────────────────────────────────────────
+regex_patterns:
+
+  # USD amount: $XXXM, $X.XB, $XXX,XXX, $XX million, ...
+  usd_amount: '\$\d{1,3}(?:[,.]?\d{3})*(?:\.\d+)?\s*(?:k|m|b|million|billion|thousand)?'
+
+  # Contracts / lots / barrels — large counts
+  contracts_count: '\b\d{1,3}(?:,\d{3})+\s*(?:contracts?|lots?|barrels?|positions?|accounts?|wallets?)\b'
+
+  # Time-before expressions: "X minutes/hours before"
+  time_before: '\b\d+\s*(?:min|mins|minute|minutes|hr|hrs|hour|hours)\s*(?:before|prior to|ahead of)\b'
+
+  # Exact times (UTC, GMT, ET, PT, ...)
+  exact_time: '\b\d{1,2}:\d{2}\s*(?:am|pm|utc|gmt|est|edt|pst|pdt|et|pt|ct|cst)\b'
+
+  # Percentage / multiplier changes (e.g. "11% drop", "10x", "5.38x leverage")
+  percentage_change: '\b\d+(?:\.\d+)?\s*%(?:\s*(?:drop|fall|crash|surge|jump|gain|rise))?'
+  leverage_multiplier: '\b\d+(?:\.\d+)?\s*x\s*(?:leverage|leveraged|short|long)\b'
+
+  # Ethereum / EVM wallet address (40-hex starting with 0x, or shorter prefix form)
+  eth_wallet_address: '\b0x[a-fA-F0-9]{4,40}\b'
+
+  # Large number + crypto unit (e.g. "86,000 BTC", "200,687 BRENTOIL")
+  crypto_quantity: '\b\d{1,3}(?:,\d{3})+\s*(?:btc|eth|sol|xrp|doge|hype|usdc|usdt|brentoil)\b'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Account priority — per-account score multiplier.
+# (Separate from credibility.py; this multiplier is for the Stage-1 filter.)
+# 1.0 = no change / >1.0 = more likely to pass / <1.0 = less likely.
+# ─────────────────────────────────────────────────────────────────────
+account_priority:
+  # Tier-A: verified on-chain analysts (low false positives).
+  lookonchain: 1.20
+  mlmabc: 1.20         # P9.4 addition — discoverer of the Hyperliquid whale
+
+  # Tier-B: automated detection bots (raw alerts, occasional noise).
+  whalealert: 1.00
+  unusual_whales: 1.10
+  unusualwhales: 1.10  # alias
+
+  # Tier-C: curation / visualization (mostly post-event analysis).
+  polymarkethistory: 1.05
+  bubblemaps: 0.95     # wallet cluster visualization — useful but post-event
+
+  # Unknown accounts default to 1.0 (handled in code).
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Irrelevant filters — early reject (multiply final score by 0).
+# Obvious non-trading noise is blocked before the LLM is called.
+# ─────────────────────────────────────────────────────────────────────
+irrelevant_filters:
+
+  # Sports betting (a large share of Polymarket volume but not our concern).
+  sports:
+    - "nba"
+    - "nfl"
+    - "mlb"
+    - "soccer"
+    - "football match"
+    - "basketball game"
+    - "tennis"
+    - "world cup"
+    - "super bowl"
+    - "lakers"
+    - "warriors"
+    - "yankees"
+
+  # Ads / spam / scam
+  spam:
+    - "airdrop"
+    - "free tokens"
+    - "presale"
+    - "ico"
+    - "ido"
+    - "join my telegram"
+    - "join my discord"
+    - "100x gem"
+    - "1000x gem"
+    - "next pepe"
+    - "next doge"
+    - "moonshot"
+
+  # Generic NFT / meme coin (retail noise unrelated to insider trading).
+  retail_meme:
+    - "nft drop"
+    - "mint live"
+    - "mint price"
+    - "floor price"
+    - "rugpull"
+    - "rug pull"
+    - "gm gm"
+    - "wagmi"
+
+
+# =====================================================================
+# Next steps (reference):
+#   1. config/x_few_shot.yaml — LLM few-shot examples for the 6 cases (Stage 2)
+#   2. src/anomaly_detection/channels/x/llm_classifier.py — GPT-5.4 + vision + caching
+#   3. src/anomaly_detection/channels/x/stage1_filter.py — load this YAML + matching
+#   4. src/anomaly_detection/channels/x/collector.py — actual X scraper
+# =====================================================================

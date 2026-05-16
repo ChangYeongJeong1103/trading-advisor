@@ -1,0 +1,561 @@
+# =====================================================================
+# config/x_few_shot.yaml — X (Twitter) Stage-2 LLM few-shot examples
+# =====================================================================
+#
+# Purpose:
+#   Few-shot training data used by GPT-5.4 to analyze X posts that have
+#   passed the Stage-1 keyword/regex filter (config/x_keywords.yaml).
+#
+#   We teach the LLM with 6 positive examples (drawn from real insider-
+#   trading cases) plus 3 negative examples (to prevent false positives):
+#   "when you see a post like this, classify it like this".
+#
+# Pipeline (reference):
+#   X post  ─→  Stage-1 filter (keyword/regex)  ─→  if score ≥ 0.80
+#   ─→  Stage-2 LLM classifier (this file)  ─→  ChannelSignal
+#
+# Editing notes:
+#   - Feel free to add or remove examples. When a new case happens, add a
+#     positive example.
+#   - The system_prompt is the single biggest lever for LLM behavior;
+#     edit with care.
+#   - When changing output_schema, also update the parser in
+#     src/anomaly_detection/channels/x/llm_classifier.py.
+#   - The input/expected_output format of each example dictates the LLM
+#     response format.
+#
+# Cost reference (GPT-5.4):
+#   input  $2.50 / 1M tokens     (cached: $0.25 / 1M)
+#   output $15.00 / 1M tokens
+#   - This yaml's system_prompt + examples ≈ ~3,500 input tokens (cached)
+#   - Average post analysis ≈ 200 input + 300 output = ~$0.005/call
+#
+# Plan: P9.4 (X channel LLM upgrade), architecture §5.4.1
+# =====================================================================
+
+
+version: "1.0"
+last_updated: "2026-04-19"
+model_target: "gpt-5.4"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# System prompt — defines the LLM persona.
+# - Written in English for repo consistency; the LLM uses the same
+#   language for its reasoning, which is then rendered directly in the
+#   alert body.
+# - "Financial analyst" persona + a clear 4-tier classification rubric.
+# ─────────────────────────────────────────────────────────────────────
+system_prompt: |
+  You are a professional financial analyst who detects market anomaly
+  patterns (insider trading / pre-event positioning). Your job is to read
+  ONE X (Twitter) post, judge how closely it matches confirmed historical
+  insider-trading events, and classify it into one of four tiers.
+
+  ─────────────────────────────────────────────────────────────
+  [Four-tier classification rubric — VERY IMPORTANT]
+  ─────────────────────────────────────────────────────────────
+
+  EMERGENCY:
+    · Very strong suspicion of pre-event trading AND a clearly stated
+      pre-event timestamp.
+    · Example: "30 minutes before the announcement, a fresh wallet opened
+      a $100M short — and then the news broke."
+    · Or signs of an imminent material market shock (leaked news + a
+      large on-chain move).
+
+  RISK_OFF:
+    · Strong suspicious pattern, but the timing/size context is weaker
+      than EMERGENCY.
+    · Example: a forensic post-mortem disclosing that a huge position
+      was opened within minutes after the announcement.
+    · Or a fresh / coordinated wallet cluster tied to a confirmed event.
+
+  WATCH:
+    · Partial pattern match (large trade + suspicious phrasing) but no
+      decisive evidence.
+    · Example: "Whale opens $50M BTC long" — reason / timing unclear.
+    · High false-positive risk → a human should take a second look.
+
+  NORMAL:
+    · Generic market commentary, after-the-fact chart analysis, or retail
+      noise.
+    · Example: "BTC bullish on chart, target $80K" / "Lakers vs Warriors
+      odds".
+
+  ─────────────────────────────────────────────────────────────
+  [Six signal dimensions to consider]
+  ─────────────────────────────────────────────────────────────
+
+  1. Timing
+     · Explicit phrasing like "X minutes/hours before the announcement".
+     · Or a forensic post-mortem within minutes after the announcement.
+
+  2. Wallet identity
+     · "Fresh / newly funded / no prior history"   → strong signal
+     · "Satoshi-era OG / known smart money"        → mild suspicion
+
+  3. Size
+     · $XXM ~ $XXXM single position, 100M+ contracts/lots.
+     · Abnormal relative to the typical trading volume.
+
+  4. Asset ↔ political-event correlation
+     · oil short + imminent Iran / Trump remark         → strong signal
+     · BTC short + imminent Fed / regulatory news       → strong signal
+     · Sports betting / meme coin                       → noise
+
+  5. Analyst suspicion language
+     · "did he have insider info?", "lucky or leaked?", "raise eyebrows"
+     · If the analyst themself flags suspicion, weight it more.
+
+  6. Coordination
+     · "wallet cluster", "coordinated", "moving in unison", "5 wallets"
+     · A cluster is more suspicious than a single whale.
+
+  ─────────────────────────────────────────────────────────────
+  [Six confirmed historical insider-trading events — reference]
+  ─────────────────────────────────────────────────────────────
+
+  · 2025-04-09  Liberation Day SPY $24M put spread (Trump tariff pause)
+  · 2025-10-10  Hyperliquid $1.1B BTC/ETH short (Trump China 100% tariff)
+  · 2026-01-03  Polymarket Maduro $32K → $436K (US capture operation)
+  · 2026-02-28  Polymarket Iran $500M+ wallet cluster (Magamyman)
+  · 2026-03-23  Oil $580M short 16 min pre-event (Trump Truth Social Iran delay)
+  · 2026-04-17  Brent $760M short 20 min pre-event (Iran FM Hormuz open)
+
+  ─────────────────────────────────────────────────────────────
+  [Conservatism rules]
+  ─────────────────────────────────────────────────────────────
+
+  · When in doubt, drop one tier (EMERGENCY → RISK_OFF, RISK_OFF → WATCH).
+  · Distinguish "post-event forensic" from "pre-event alert".
+    Forensic posts max out at RISK_OFF (never EMERGENCY), even if the
+    underlying event is confirmed.
+  · If an image is attached, also factor in chart / wallet visualizations.
+  · Only extract symbols we can actually trade:
+    BTC, ETH, SOL, XRP, DOGE, HYPE, CL (=oil/WTI), GC (=gold),
+    ES (=SPY/SPX), NQ (=QQQ), POLYMARKET (special marker).
+
+  ─────────────────────────────────────────────────────────────
+  [Output format — JSON ONLY]
+  ─────────────────────────────────────────────────────────────
+
+  Respond strictly with the JSON schema below — no prose, no markdown,
+  no comments.
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Output schema — the JSON the LLM must return.
+# (Validated by the parser in llm_classifier.py.)
+# ─────────────────────────────────────────────────────────────────────
+output_schema:
+  type: object
+  required:
+    - tier
+    - confidence
+    - direction
+    - symbols
+    - key_signals
+    - reasoning
+  properties:
+    tier:
+      type: string
+      enum: ["NORMAL", "WATCH", "RISK_OFF", "EMERGENCY"]
+      description: "Four-tier classification."
+    confidence:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Confidence in the insider-trading pattern match."
+    direction:
+      type: string
+      enum: ["BUY", "SELL", "NEUTRAL"]
+      description: "Trade direction inferred from the post."
+    symbols:
+      type: array
+      items: { type: string }
+      description: "Canonical symbols of the affected assets — BTC, ETH, CL, GC, ES, ..."
+    key_signals:
+      type: array
+      items: { type: string }
+      description: "List of the key signals detected (short English phrases)."
+    matched_case:
+      type: ["string", "null"]
+      description: "ID of the most similar historical case, or null."
+    reasoning:
+      type: string
+      description: "1-3 sentence analysis (used directly in the alert body)."
+    is_pre_event:
+      type: boolean
+      description: "true if this is a pre-event alert, false if it is post-event forensic."
+    recommend_action:
+      type: ["string", "null"]
+      description: "Human follow-up action (e.g. 'check the TradingView CL1! chart')."
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Few-shot examples
+# ─────────────────────────────────────────────────────────────────────
+# 6 positive (confirmed cases) + 3 negative (false-positive guards).
+#
+# Each example's input.text is a paraphrase of a real X post, not a verbatim
+# quote — a synthetic representative example for the LLM to learn the pattern.
+# ─────────────────────────────────────────────────────────────────────
+examples:
+
+  # ═════════════════════════════════════════════════════════════════
+  # POSITIVE 1 — 2025-04-09 Liberation Day SPY put spread
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: liberation_day_2025_04_09
+    label: positive
+    input:
+      account: "@unusual_whales"
+      account_credibility: "high (verified options flow tracker)"
+      timestamp_utc: "2025-04-08 18:43:00"
+      text: |
+        🚨 UNUSUAL OPTIONS ACTIVITY 🚨
+        Massive $24.5M SPY put spread just printed.
+        Strike: 510P / 480P expiring Apr 19.
+        Total premium: ~$24M. This is a pre-Liberation Day hedge or
+        someone knows something. Smart money positioning before tomorrow's
+        announcement?
+      image_description: "SPY options chain screenshot showing 35,000 put
+        contracts traded, dark pool flow indicator highlighted in red."
+    expected_output:
+      tier: "RISK_OFF"
+      confidence: 0.82
+      direction: "SELL"
+      symbols: ["ES"]
+      key_signals:
+        - "massive options spread ($24.5M premium)"
+        - "pre-announcement timing (1 day before Liberation Day)"
+        - "analyst suspicion phrase: 'someone knows something'"
+        - "verified options-flow source"
+      matched_case: "2025.04.09_liberation_day_spy"
+      reasoning: |
+        A large SPY put spread ($24.5M) printed right before the Liberation
+        Day announcement. The analyst explicitly voiced suspicion with
+        "someone knows something", and unusual_whales is a verified options
+        flow source. Pre-event positioning is plausible. Not strong enough
+        for EMERGENCY (no concrete leak evidence), but operators should
+        immediately consider an SPY/ES short hedge.
+      is_pre_event: true
+      recommend_action: "Check the TradingView ES1! / SPY chart and hedge positions before tomorrow's release."
+
+  # ═════════════════════════════════════════════════════════════════
+  # POSITIVE 2 — 2025-10-10 Hyperliquid $1.1B BTC/ETH short
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: hyperliquid_china_tariff_2025_10_10
+    label: positive
+    input:
+      account: "@Lookonchain"
+      account_credibility: "high (top on-chain analyst)"
+      timestamp_utc: "2025-10-09 16:54:00"
+      text: |
+        A Bitcoin OG just deposited 80M USDC to Hyperliquid and opened a
+        massive BTC short with 10x leverage. Position size ~$800M notional.
+        This wallet has been dormant since 2014 (Satoshi-era).
+        Why now? Did he have insider info?
+      image_description: "Hyperliquid liquidations dashboard showing single
+        wallet 0xabc...123 with $800M BTC-PERP short, entry $61,200,
+        liquidation price $67,500."
+    expected_output:
+      tier: "EMERGENCY"
+      confidence: 0.93
+      direction: "SELL"
+      symbols: ["BTC"]
+      key_signals:
+        - "massive size ($800M notional)"
+        - "Satoshi-era OG wallet (dormant since 2014, suspicious activation)"
+        - "10x leveraged short"
+        - "analyst explicit suspicion: 'Did he have insider info?'"
+        - "pre-event timing (28h before Trump China tariff announcement)"
+        - "high-credibility source (Lookonchain)"
+      matched_case: "2025.10.10_hyperliquid_china_tariff"
+      reasoning: |
+        A Satoshi-era wallet suddenly woke up and opened an $800M BTC
+        short at 10x. Lookonchain (a verified source) directly raised the
+        question "Did he have insider info?". This matches the established
+        pattern (massive short → political announcement minutes later).
+        Move to immediate BTC/crypto risk-off; cross-check signals from
+        the other channels (CME, Polymarket).
+      is_pre_event: true
+      recommend_action: "Check the TradingView BTC chart and Hyperliquid open interest."
+
+  # ═════════════════════════════════════════════════════════════════
+  # POSITIVE 3 — 2026-01-03 Polymarket Maduro $32K → $436K
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: maduro_polymarket_2026_01_03
+    label: positive
+    input:
+      account: "@PolymarketHistory"
+      account_credibility: "medium (curation account, post-event focus)"
+      timestamp_utc: "2026-01-04 02:25:00"
+      text: |
+        Wallet 0x31a56e turned $32,000 into $436,000 betting YES on
+        "Maduro out of office in Q1 2026" market. Last bet was placed
+        Jan 2, 9:58 PM ET — just hours before Operation Absolute Resolve
+        was announced. Wallet was freshly funded with no prior history
+        on Polymarket. Lucky or leaked?
+      image_description: "Polymarket trade history screenshot — 14 YES
+        bets clustered in 6h window, profit chart with vertical line
+        marking 'Maduro capture announced'."
+    expected_output:
+      tier: "RISK_OFF"
+      confidence: 0.88
+      direction: "BUY"
+      symbols: ["POLYMARKET"]
+      key_signals:
+        - "freshly funded wallet (no prior history)"
+        - "concentrated betting cluster (6h window before event)"
+        - "13.6x return ($32K → $436K)"
+        - "explicit suspicion phrase 'Lucky or leaked?'"
+        - "post-event forensic disclosure"
+      matched_case: "2026.01.03_maduro_polymarket"
+      reasoning: |
+        Right before the Maduro operation, a freshly funded wallet turned
+        $32K into $436K. The cluster analyst flagged it with "Lucky or
+        leaked?". Since the post itself is a post-event forensic (Jan 4),
+        the tier is RISK_OFF rather than EMERGENCY. Use it to grow the
+        case study library and as a trigger for future tracking of
+        similar wallets.
+      is_pre_event: false
+      recommend_action: "Add Polymarket wallet 0x31a56e to the watchlist and alert on similar wallet patterns."
+
+  # ═════════════════════════════════════════════════════════════════
+  # POSITIVE 4 — 2026-02-28 Iran first strike / Polymarket cluster
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: iran_first_strike_polymarket_2026_02_28
+    label: positive
+    input:
+      account: "@Bubblemaps"
+      account_credibility: "medium (wallet visualization specialist)"
+      timestamp_utc: "2026-03-01 14:12:00"
+      text: |
+        Coordinated cluster of 5 wallets (incl. Magamyman) bet $500M+ YES
+        on "US strikes Iran in Feb 2026" market — implied probability was
+        12% but they loaded up 5 days before Operation Epic Fury.
+        93% of these wallets profited. Wallet splitting pattern visible
+        (same-day funded from same source). Khamenei addressed nation 4
+        days later. Smart money or leaked intel?
+      image_description: "Bubblemaps cluster diagram — 5 connected nodes
+        with funding flows from single root wallet, total volume $500M+,
+        all betting same outcome."
+    expected_output:
+      tier: "RISK_OFF"
+      confidence: 0.90
+      direction: "BUY"
+      symbols: ["POLYMARKET"]
+      key_signals:
+        - "wallet cluster coordination (5 wallets, same funding source)"
+        - "size $500M+ across cluster"
+        - "5 days pre-event positioning"
+        - "low implied probability (12%) — high payoff"
+        - "93% success rate (statistical anomaly)"
+        - "named pattern (Magamyman wallet splitting)"
+      matched_case: "2026.02.28_iran_first_strike_polymarket"
+      reasoning: |
+        Five wallets funded from a single source loaded up $500M+ of YES
+        bets on the Iran strike market five days before the event, at a
+        12% implied probability — and 93% of them profited. This is not
+        a lone whale but a coordinated insider cluster, and Bubblemaps's
+        visualization confirms the structure. Post-event analysis, but
+        the pattern strength warrants RISK_OFF.
+      is_pre_event: false
+      recommend_action: "Add every wallet in the Magamyman cluster to the watchlist and alert on future Iran/geopolitical markets."
+
+  # ═════════════════════════════════════════════════════════════════
+  # POSITIVE 5 — 2026-03-23 Oil short 16 min pre-event (Truth Social leak)
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: trump_truthsocial_oil_2026_03_23
+    label: positive
+    input:
+      account: "@unusual_whales"
+      account_credibility: "high (verified options flow tracker)"
+      timestamp_utc: "2026-03-23 18:16:00"
+      text: |
+        🚨 BREAKING 🚨 Just 16 minutes before Trump's Truth Social post
+        about "delaying attacks on Iran energy infrastructure", someone
+        sold 6,200 WTI futures contracts (~$580M notional) in a single
+        burst. Pre-tweet front-running. This is the third "lucky"
+        oil trade this year. How did they know?
+      image_description: "WTI 1-minute candle chart showing massive
+        volume bar at 11:00 GMT, Trump tweet timestamp 11:05 GMT marked
+        with arrow."
+    expected_output:
+      tier: "EMERGENCY"
+      confidence: 0.95
+      direction: "SELL"
+      symbols: ["CL"]
+      key_signals:
+        - "precise timing (16 min before tweet)"
+        - "size $580M / 6,200 contracts in single burst"
+        - "explicit front-running label"
+        - "pattern recurrence ('third lucky oil trade')"
+        - "analyst direct question 'How did they know?'"
+        - "high-credibility source (unusual_whales)"
+      matched_case: "2026.03.23_trump_truthsocial_oil"
+      reasoning: |
+        Sixteen minutes before Trump's Truth Social post, 6,200 WTI
+        contracts ($580M) were sold in a single burst. The analyst
+        explicitly labels it "pre-tweet front-running" and notes it is
+        the third such case — pointing to systemic leakage. Even though
+        the post is post-event, the pattern confidence is high enough
+        to remain EMERGENCY. Immediately alert any trader holding
+        CL/WTI/oil positions.
+      is_pre_event: false
+      recommend_action: "Check the TradingView CL1! chart, inspect WTI/Brent open interest, and tighten Trump Truth Social monitoring."
+
+  # ═════════════════════════════════════════════════════════════════
+  # POSITIVE 6 — 2026-04-17 Brent short 20 min pre-event (Hormuz open)
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: iran_hormuz_brent_2026_04_17
+    label: positive
+    input:
+      account: "@mlmabc"
+      account_credibility: "high (Hyperliquid whale specialist)"
+      timestamp_utc: "2026-04-17 13:08:00"
+      text: |
+        Single wallet just dumped 7,990 ICE Brent lots ($760M short)
+        between 12:24-12:25 GMT. Exactly 20 minutes later, Iran FM
+        Araghchi posted Hormuz Strait is "completely open". This is
+        identical to the March 23 oil play. Same MO. Pre-event or
+        precognition? 🤔
+      image_description: "Brent crude futures 1-min chart with red
+        volume spike, Iran FM tweet timestamp annotated, red arrow
+        showing 20-min gap."
+    expected_output:
+      tier: "EMERGENCY"
+      confidence: 0.94
+      direction: "SELL"
+      symbols: ["CL"]
+      key_signals:
+        - "precise timing (20 min before announcement)"
+        - "size $760M / 7,990 lots"
+        - "single wallet (concentrated risk)"
+        - "explicit pattern match to March 23 case"
+        - "analyst suspicion 'Pre-event or precognition?'"
+        - "high-credibility specialist source"
+      matched_case: "2026.04.17_iran_hormuz_brent"
+      reasoning: |
+        A single wallet went $760M short on Brent twenty minutes before
+        the Iran-Hormuz announcement. mlmabc explicitly compares the MO
+        to the March 23 case. Taken together, the two events confirm a
+        systemic insider-trading pattern in the oil market. Move oil /
+        energy positions to risk-off and cross-check across all channels.
+      is_pre_event: false
+      recommend_action: "Check the TradingView CL1! / BZ1! chart, track the single wallet, and review oil positions whenever Iran/energy news is imminent."
+
+  # ═════════════════════════════════════════════════════════════════
+  # NEGATIVE 1 — Generic crypto bullish noise (false-positive guard)
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: negative_generic_btc_bullish
+    label: negative
+    input:
+      account: "@unusual_whales"
+      account_credibility: "high (verified options flow tracker)"
+      timestamp_utc: "2026-04-15 09:30:00"
+      text: |
+        BTC just broke $70K resistance with massive volume. Bulls in
+        control. Calls printing on Deribit. Next target $75K then $80K.
+        Loading up here. 🚀
+      image_description: "BTC 4h chart with bullish breakout candle and
+        moving averages aligned upward."
+    expected_output:
+      tier: "NORMAL"
+      confidence: 0.15
+      direction: "BUY"
+      symbols: ["BTC"]
+      key_signals:
+        - "generic technical analysis (resistance break)"
+        - "no insider trading patterns (no timing/wallet/coordination)"
+        - "no specific event reference"
+      matched_case: null
+      reasoning: |
+        Generic chart-based bullish commentary. Keywords like "massive",
+        "loading up", and "calls" trigger the filter, but none of the
+        insider-trading signal dimensions (timing / fresh wallet /
+        coordination / event correlation) are present. Retail/technical
+        noise.
+      is_pre_event: false
+      recommend_action: null
+
+  # ═════════════════════════════════════════════════════════════════
+  # NEGATIVE 2 — Legitimate market commentary (false-positive guard)
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: negative_legitimate_oil_commentary
+    label: negative
+    input:
+      account: "@Lookonchain"
+      account_credibility: "high (top on-chain analyst)"
+      timestamp_utc: "2026-04-16 22:00:00"
+      text: |
+        WTI crude oil sold off 2% today as EIA inventories rose more
+        than expected. OPEC+ meeting next week may bring volatility.
+        Energy sector ETFs underperformed. Watching key support at $72.
+      image_description: null
+    expected_output:
+      tier: "NORMAL"
+      confidence: 0.10
+      direction: "SELL"
+      symbols: ["CL"]
+      key_signals:
+        - "legitimate macro/fundamental analysis"
+        - "no abnormal trade size mentioned"
+        - "no pre-event timing claim"
+        - "no wallet/coordination signal"
+      matched_case: null
+      reasoning: |
+        Standard fundamental commentary on EIA inventory data. Keywords
+        like "WTI", "sold off", and "energy" trigger the filter, but the
+        post does not match any of the insider-trading signal dimensions.
+        Normal analyst post.
+      is_pre_event: false
+      recommend_action: null
+
+  # ═════════════════════════════════════════════════════════════════
+  # NEGATIVE 3 — Sports / unrelated Polymarket noise
+  # ═════════════════════════════════════════════════════════════════
+  - case_id: negative_sports_polymarket
+    label: negative
+    input:
+      account: "@PolymarketHistory"
+      account_credibility: "medium (curation account)"
+      timestamp_utc: "2026-04-14 03:00:00"
+      text: |
+        Whale just bet $2M YES on "Lakers win NBA Finals 2026" at 18%
+        implied probability. Wallet 0xabc...321 has been a regular
+        sports bettor since 2024. Big bet, big risk!
+      image_description: "Polymarket sports market screenshot with $2M
+        position size highlighted."
+    expected_output:
+      tier: "NORMAL"
+      confidence: 0.05
+      direction: "BUY"
+      symbols: ["POLYMARKET"]
+      key_signals:
+        - "sports betting (out of scope for trading risk)"
+        - "established wallet history (not freshly funded)"
+        - "no political/macro event correlation"
+      matched_case: null
+      reasoning: |
+        Sports betting. The amount is large ($2M, "whale", "big bet")
+        but out of scope for our trading universe (the NBA Finals do
+        not affect our markets). The wallet is a regular sports bettor,
+        not a fresh wallet. NORMAL.
+      is_pre_event: false
+      recommend_action: null
+
+
+# =====================================================================
+# Next steps (reference):
+#   1. (done) config/x_keywords.yaml — Stage-1 filter
+#   2. (done) config/x_few_shot.yaml — Stage-2 LLM prompt + examples (this file)
+#   3. (todo) src/anomaly_detection/channels/x/llm_classifier.py
+#         - load this yaml, call GPT-5.4, vision support, output validation, cache
+#   4. (todo) src/anomaly_detection/channels/x/stage1_filter.py
+#         - load x_keywords.yaml, compute score, compare to threshold
+#   5. (todo) src/anomaly_detection/channels/x/collector.py
+#         - actual X scraper (snscrape v0, X API v2 fallback in EVT-1)
+#   6. (todo) docs/v1-anomaly_detection/anomaly-upgrade-plan.md  — add P9.4 section
+# =====================================================================

@@ -1,0 +1,128 @@
+"""
+channels/base.py — Channel abstract interface (architecture §2, §3).
+
+Every channel (polymarket, hyperliquid, cme, x) inherits this base class.
+Core (registry, orchestrator, fusion engine) only knows this interface →
+adding a new channel is easy (just register it).
+
+────────────────────────────────────────────────────────────────────────
+Lifecycle (architecture §3 Process View, §6.6 Failure Mode):
+
+  __init__(config, deps)         # inject config + storage/cost/health deps
+  await start()                  # start collector + feature + detector loop
+  ...   (running)
+  await stop()                   # graceful shutdown (WS close, buffer flush)
+
+Health monitoring:
+  property last_event_ts         # polled by health.make_staleness_check
+  property is_running             # track start/stop state
+
+Signal output:
+  get_current_signal() → polled by the fusion engine each cycle.
+  Returns the signal in the recent fresh window if any, otherwise None.
+  None = "this channel is currently NORMAL" (fusion engine treats it as NORMAL tier).
+
+────────────────────────────────────────────────────────────────────────
+Why polling model (instead of push):
+
+  - The fusion engine snapshots every channel's current state on a fixed cadence
+    (e.g. 5s) — comparisons are consistent (no race conditions).
+  - The channel does NOT call the fusion engine directly → one-way dependency.
+  - From a channel's perspective: just run the detector and update latest_signal.
+
+  Downside: short burst signals occurring/dissipating between polls can be missed.
+  → Solved by each channel keeping its latest_signal for K seconds via an internal "sticky window".
+
+  Pushing is reconsidered in the P9 detection deep-dive.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import ClassVar
+
+from ..core.schemas import ChannelSignal
+
+
+class Channel(ABC):
+    """Abstract base class for all channels.
+
+    Subclasses must implement 4 abstract members:
+      - name (override the ClassVar)
+      - last_event_ts (property)
+      - start() / stop() (async)
+      - get_current_signal()
+    """
+
+    # Override with one of schemas.CHANNEL_* constants in the subclass.
+    # e.g.: class PolymarketChannel(Channel): name = CHANNEL_POLYMARKET
+    name: ClassVar[str] = "abstract"
+
+    # ─────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────
+    @abstractmethod
+    async def start(self) -> None:
+        """Start the channel — kicks off collector / feature / detector loop.
+
+        Called by the orchestrator inside an asyncio.gather.
+        Typically the implementation spawns an internal task and returns immediately.
+        If it raises, the orchestrator treats it as a contract-test failure.
+        """
+        ...
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Graceful shutdown — WebSocket close, in-flight flush, cancel internal tasks.
+
+        Called on SIGTERM (Cloud Run instance replacement) or on a contract-test failure.
+        Must be idempotent (safe to call multiple times).
+        """
+        ...
+
+    # ─────────────────────────────────────────────────────────────────
+    # Signal output (polled by the fusion engine)
+    # ─────────────────────────────────────────────────────────────────
+    @abstractmethod
+    def get_current_signal(self) -> ChannelSignal | None:
+        """Return the most recent valid ChannelSignal.
+
+        Returns:
+            ChannelSignal: a signal emitted by the detector within the recent fresh window.
+            None: no signal within that window → fusion treats as NORMAL tier.
+
+        Implementation guide:
+          - Keep "last signal + ts" inside the channel.
+          - On get_current_signal, return None if (now - signal.ts) exceeds the fresh
+            window (e.g. 60s) — stale signals auto-expire.
+          - Sync function — lets the fusion engine call frequently without locks.
+        """
+        ...
+
+    # ─────────────────────────────────────────────────────────────────
+    # Health monitoring (read-only properties)
+    # ─────────────────────────────────────────────────────────────────
+    @property
+    @abstractmethod
+    def last_event_ts(self) -> datetime | None:
+        """ts (UTC) of the most recently processed RawEvent.
+
+        monitoring.health.make_staleness_check polls this to determine
+        UNHEALTHY/DEGRADED. None right after boot.
+        """
+        ...
+
+    @property
+    def is_running(self) -> bool:
+        """True from after start() until before stop().
+
+        Default implementation: always False. Subclasses should override with their internal flag.
+        """
+        return False
+
+    # ─────────────────────────────────────────────────────────────────
+    # Convenience
+    # ─────────────────────────────────────────────────────────────────
+    def __repr__(self) -> str:
+        return f"<Channel name={self.name} running={self.is_running}>"

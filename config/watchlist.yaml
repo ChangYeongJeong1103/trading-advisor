@@ -1,0 +1,132 @@
+# =====================================================================
+# config/watchlist.yaml — D10 symbols universe
+# =====================================================================
+# Edit this file and restart the daemon to apply a new watchlist.
+# (v1 has no hot-reload — restart is required. To be revisited in v2.)
+#
+# Add or remove freely, but keep the per-channel identifier format.
+# =====================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Polymarket — market slug or condition_id.
+# (the <slug> in polymarket.com/market/<slug>)
+# ─────────────────────────────────────────────────────────────────────
+polymarket_markets:
+  # ── geopolitical / Iran — short-term (May expiry, very active) ──
+  # P12-C refresh (2026-05-14): the four April-expiry markets expired and
+  # were replaced with the May 31 short-term set below.
+  - "us-x-iran-permanent-peace-deal-by-may-31-2026-333-871-241-192"  # $632k/24h, short peace-deal bet
+  - "strait-of-hormuz-traffic-returns-to-normal-by-end-of-may"        # $574k/24h, direct oil exposure
+  - "us-obtains-iranian-enriched-uranium-by-may-31-396"               # $574k/24h, uranium-handoff scenario
+
+  # ── geopolitical / Iran — mid-term (June expiry, signal continues after May markets close) ──
+  - "strait-of-hormuz-traffic-returns-to-normal-by-end-of-june"       # $365k/24h, Hormuz June backup
+  - "will-the-iranian-regime-fall-by-june-30"                         # existing — regime change, June expiry
+  - "us-x-iran-permanent-peace-deal-by-june-30-2026-837-641-896-877"  # $215k/24h, peace deal June expiry
+
+  # ── geopolitical / Iran — long-term (Dec expiry, baseline) ──
+  - "will-the-us-invade-iran-before-2027"          # existing — most active Iran market on Polymarket
+  - "us-iran-nuclear-deal-before-2027"             # existing — diplomatic surprise (Dec expiry)
+
+  # ── macro / Fed — June FOMC (2026-06-17 expiry, both hawkish/dovish tails) ──
+  # Watch both tails — if one side's odds suddenly jump, that hints at insider flow.
+  - "will-the-fed-decrease-interest-rates-by-25-bps-after-the-june-2026-meeting"  # $274k/24h, dovish surprise
+  - "will-the-fed-increase-interest-rates-by-25-bps-after-the-june-2026-meeting"  # $520k/24h, hawkish surprise
+
+  # ── macro / Fed — cumulative cuts by year-end (long-term) ──
+  - "will-7-fed-rate-cuts-happen-in-2026"          # $204k/24h, Dec expiry backup
+
+  # ── geopolitical / Russia–Ukraine (added in P12-C) ──
+  # Covers ceasefire / regime / NATO escalation.
+  - "russia-x-ukraine-ceasefire-agreement-by-june-30-2026"  # $61k/24h, ceasefire negotiation signal
+  - "will-russia-invade-a-nato-country-by-june-30-2026"     # $19k/24h, NATO escalation tail risk
+
+  # NOTE: expired slugs are silently skipped by the daemon (logging.debug).
+  #       Edit this watchlist freely → restart the daemon to apply
+  #       (Cloud Run requires an image rebuild).
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Hyperliquid — asset name (BTC, ETH, ...; the perp contract is implicit).
+# ─────────────────────────────────────────────────────────────────────
+hyperliquid_assets:
+  - "BTC"
+  - "ETH"
+  - "SOL"   # P9.2.P2 — expand new_whale_v1 detector coverage (3-coin baseline)
+  # - "ARB"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CME futures — root symbol
+#   CL = WTI Crude Oil (NYMEX)
+#   BZ = Brent Crude Oil (CME's Brent — proxy for ICE Brent spillover)
+#   GC = Gold (COMEX)
+#   ES = E-mini S&P 500 (CME)
+#   NQ = E-mini Nasdaq 100
+#   ZB = US Treasury Bond
+#   6E = EUR/USD
+# ─────────────────────────────────────────────────────────────────────
+# P9.3 (CME detector v2): we watch 4 symbols, covering Trump statements,
+# Middle East events, and macro releases.
+# - CL + BZ: oil events such as 4/17 Iran-Brent (BZ also catches Brent-led moves).
+# - ES:      equity-wide events such as 4/2 Liberation Day or 4/9 Truth Social.
+# - GC:      risk-off / safe-haven flow (war fear, inflation surprise).
+cme_symbols:
+  - "CL"   # WTI — most sensitive to Trump Middle East statements and OPEC decisions
+  - "BZ"   # Brent (CME) — spillover proxy for ICE-Brent-led events like 4/17
+  - "GC"   # Gold — risk-off hedge (Iran / war signals)
+  - "ES"   # S&P futures — broad market (Trump tariffs, Fed surprises)
+  # - "NQ"
+  # - "ZB"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# X (Twitter) — handles (without the leading @).
+# Automated anomaly-detection accounts. We use their output only as
+# corroboration for our own detectors.
+#
+# Selection criteria (decided 2026-05-04):
+#   1) Cover an area that our raw-data channels (Polymarket / Hyperliquid /
+#      CME) cannot see directly.
+#   2) Provide curated / human-interpreted information such as options flow.
+#   3) Use a "trade alert" style that an LLM classifier can parse easily.
+#
+# X PAYG cost — $0.005 per read. Polling every 10 minutes; only new posts
+# are fetched via since_id.
+#   · Lookonchain    : ~15 posts/day → ~$2.25 / month
+#   · unusual_whales : ~40 posts/day → ~$6 / month
+#   = total ~$8.25 / month
+#
+# Accounts considered but excluded (reason):
+#   · WhaleAlert        — mostly exchange hot/cold shuffles (low signal/noise)
+#                         and BTC/ETH overlap with the Hyperliquid channel; expensive.
+#   · PolymarketHistory — the Polymarket channel already sees every raw trade
+#                         (redundant).
+#   · Bubblemaps        — no actionable signal (mostly visualization).
+#   · @DeItaone / @zerohedge / @arkham — macro/narrative yes, insider signal no.
+#   · @SpotGamma        — has insider relevance but is analysis-style (hard for
+#                         the LLM to parse) and overlaps with unusual_whales on
+#                         options flow. Revisit in v2.
+# ─────────────────────────────────────────────────────────────────────
+x_accounts:
+  - "Lookonchain"          # curated on-chain whale narratives
+  - "unusual_whales"       # options flow / dark pool — zero coverage elsewhere
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Truth Social (Channel 5, Step 3 — Trump only, v1)
+# ─────────────────────────────────────────────────────────────────────
+# Step 3 pipeline:
+#   collector (5-minute polling) → ReferenceDB hybrid retrieval (keyword + embedding)
+#   → GPT-5.4 scorer → ChannelSignal (NORMAL / WATCH / RISK_OFF / EMERGENCY)
+#
+# Cost estimate: ~$0.005 per post (input 3-5K tokens + output 500 tokens).
+#   · Average Trump posts/day = 10-30 → daily $0.05-0.15
+#   · Monthly ~$3-5 (similar to the X channel)
+#
+# v1 watches a single account (realDonaldTrump). Multi-account support is
+# planned as a v2 follow-up.
+# ─────────────────────────────────────────────────────────────────────
+truth_social_accounts:
+  - "realDonaldTrump"
