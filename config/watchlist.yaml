@@ -40,7 +40,6 @@ polymarket_markets:
   # ── geopolitical / Russia–Ukraine (added in P12-C) ──
   # Covers ceasefire / regime / NATO escalation.
   - "russia-x-ukraine-ceasefire-agreement-by-june-30-2026"  # $61k/24h, ceasefire negotiation signal
-  - "will-russia-invade-a-nato-country-by-june-30-2026"     # $19k/24h, NATO escalation tail risk
 
   # NOTE: expired slugs are silently skipped by the daemon (logging.debug).
   #       Edit this watchlist freely → restart the daemon to apply

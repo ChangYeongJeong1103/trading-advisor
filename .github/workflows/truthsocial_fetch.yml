@@ -1,0 +1,84 @@
+name: truthsocial_fetch
+
+# ─────────────────────────────────────────────────────────────────────
+# What this does:
+#   Every 5 minutes, fetch Trump's latest Truth Social posts from a
+#   GitHub-hosted runner (Azure IP — passes Cloudflare bot detection)
+#   and upload the result to gs://anomaly-truthsocial/realDonaldTrump/
+#   latest.json. The anomaly daemon on Cloud Run then reads that file
+#   as its Truth Social data source.
+#
+# Why GitHub Actions and not Cloud Run:
+#   Cloudflare aggressively blocks requests originating from GCP
+#   datacenter IP ranges with HTTP 403, even with a perfect TLS
+#   fingerprint. GitHub Actions runs on Azure IPs which Cloudflare
+#   currently lets through.
+#
+# Secrets required (Settings → Secrets and variables → Actions):
+#   GCP_TRUTHSOCIAL_PUBLISHER_KEY
+#     The full JSON contents of the service-account key for
+#     truthsocial-publisher@trading-advisor-478909.iam.gserviceaccount.com.
+#     Generated via `gcloud iam service-accounts keys create`.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # GitHub cron is UTC. Run every 5 minutes.
+    # NOTE: GitHub Actions schedules can be skipped under heavy load and
+    # are best-effort — the daemon's "last update" timestamp on GCS is
+    # the source of truth.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # allow manual triggering for debugging
+
+# Avoid stacking up runs if a previous one is still going (rare since
+# the script finishes in ~10s, but guards against runner queueing).
+concurrency:
+  group: truthsocial_fetch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fetch_and_upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      GCS_BUCKET: anomaly-truthsocial
+      GCS_OBJECT_PREFIX: realDonaldTrump
+      TRUTH_SOCIAL_LIMIT: "40"
+      TRUTH_SOCIAL_IMPERSONATE: chrome116
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/truthsocial_publisher/requirements.txt
+
+      - name: Install deps
+        working-directory: tools/truthsocial_publisher
+        run: pip install -r requirements.txt
+
+      - name: Write GCP service-account key to disk
+        # JSON 키는 secret 으로 보관 — workflow 가 임시 파일로 떨궈서
+        # GOOGLE_APPLICATION_CREDENTIALS 가 가리키게 함. 실행 끝나면
+        # runner 가 통째로 폐기되므로 추가 cleanup 불필요.
+        env:
+          GCP_KEY_JSON: ${{ secrets.GCP_TRUTHSOCIAL_PUBLISHER_KEY }}
+        run: |
+          if [ -z "$GCP_KEY_JSON" ]; then
+            echo "❌ secret GCP_TRUTHSOCIAL_PUBLISHER_KEY is empty"
+            exit 1
+          fi
+          printf '%s' "$GCP_KEY_JSON" > "$RUNNER_TEMP/gcp-key.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
+
+      - name: Run publisher
+        working-directory: tools/truthsocial_publisher
+        run: python main.py

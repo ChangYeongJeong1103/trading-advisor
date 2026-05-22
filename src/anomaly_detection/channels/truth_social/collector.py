@@ -4,9 +4,9 @@ channels/truth_social/collector.py — Trump Truth Social timeline collector.
 ────────────────────────────────────────────────────────────────────────
 Responsibilities:
   GET directly against the Mastodon-compatible public API endpoint via
-  ``httpx.AsyncClient`` and fetch only Trump's new posts. No token / login
-  needed (since the 2025-08-27 policy, Truth Social exposes prominent
-  figures' statuses unauthenticated).
+  ``curl_cffi.AsyncSession`` and fetch only Trump's new posts. No token /
+  login needed (since the 2025-08-27 policy, Truth Social exposes
+  prominent figures' statuses unauthenticated).
 
   Two call modes:
 
@@ -21,30 +21,68 @@ Responsibilities:
         post in the time range. For reference DB curation.
 
 ────────────────────────────────────────────────────────────────────────
-Cloudflare evasion:
+Cloudflare evasion (2026-05-22 update — P12-E):
 
-  · Standard browser User-Agent (overridable via env).
-  · Accept-Language: en-US,en;q=0.9
-  · 5min + ±60s jitter (handled at the channel layer; here it's just a single call).
-  · 429/5xx → tenacity exponential backoff (max 3 attempts).
+  Truth Social sits behind Cloudflare, so a plain httpx request gets
+  flagged by JA3/TLS fingerprinting → 403 "Just a moment..." (Cloudflare
+  JS challenge page).
+
+  Mitigation: use ``curl_cffi.requests.AsyncSession(impersonate="chrome116")``
+  which mimics a real Chrome ClientHello + HTTP/2 SETTINGS frame, bypassing
+  Cloudflare bot detection.
+  (Measured 2026-05-22: chrome119+ is blocked. chrome116/110 and safari17_0
+  pass. Truth Social's web client appears to expect a ~Chrome 116 fingerprint.) Other layers stay the same:
+    · Standard browser User-Agent (overridable via env)
+    · Accept-Language: en-US,en;q=0.9
+    · 5min + ±60s jitter (handled at the channel layer)
+    · 429/5xx → tenacity exponential backoff (max 3 attempts)
 
 ────────────────────────────────────────────────────────────────────────
 Env vars:
 
-  TRUTH_SOCIAL_TIMEOUT_S  int (default 30)  — per-request timeout
-  TRUTH_SOCIAL_USER_AGENT str               — header override (Cloudflare evasion)
-  TRUTH_SOCIAL_HOST       str (default "https://truthsocial.com")
+  TRUTH_SOCIAL_TIMEOUT_S    int (default 30)  — per-request timeout
+  TRUTH_SOCIAL_USER_AGENT   str               — UA override (default usually fine)
+  TRUTH_SOCIAL_HOST         str (default "https://truthsocial.com")
+  TRUTH_SOCIAL_IMPERSONATE  str (default "chrome116") — curl_cffi profile key.
+      Measured (2026-05-22): chrome116, chrome110, safari17_0, safari15_5
+      all pass. chrome119+ is blocked. Recommended fallback: "safari17_0".
+
+──────────────────────────────────────────────────────────────────────
+Data sources — "direct" vs "gcs" (P12-E.2, 2026-05-22):
+
+  Measurements show Cloudflare blocks GCP-datacenter IPs regardless of
+  fingerprint (Cloud Run cannot pass with any impersonate profile).
+  Two source modes are supported:
+
+    source="direct"  (default, for local/dev)
+        Fetches Truth Social directly via curl_cffi. Works from
+        residential IPs, Azure (GitHub Actions), and local Docker.
+        Blocked on Cloud Run.
+
+    source="gcs"  (production on Cloud Run)
+        Reads gs://<bucket>/<prefix>/latest.json every cycle. A separate
+        process (e.g. tools/truthsocial_publisher/ running on GitHub
+        Actions) fetches the data via curl_cffi and uploads the snapshot.
+
+──────────────────────────────────────────────────────────────────────
+Additional env vars:
+
+  TRUTH_SOCIAL_SOURCE      str (default "direct") — "direct" or "gcs".
+  TRUTH_SOCIAL_GCS_BUCKET  str (default "anomaly-truthsocial") — bucket name.
+  TRUTH_SOCIAL_GCS_PREFIX  str (default "realDonaldTrump")   — object prefix.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
-import httpx
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -102,7 +140,11 @@ class TrumpCollector:
         host: str | None = None,
         user_agent: str | None = None,
         timeout_s: float | None = None,
-        client: httpx.AsyncClient | None = None,
+        client: AsyncSession | None = None,
+        impersonate: str | None = None,
+        source: Literal["direct", "gcs"] | None = None,
+        gcs_bucket: str | None = None,
+        gcs_prefix: str | None = None,
     ) -> None:
         self.account_id = account_id
         self.host = (
@@ -117,17 +159,71 @@ class TrumpCollector:
             if timeout_s is not None
             else float(os.environ.get("TRUTH_SOCIAL_TIMEOUT_S", "30"))
         )
+        # curl_cffi impersonate profile — measured (2026-05-22):
+        #   ✅ chrome116, chrome110, safari17_0, safari15_5 all pass
+        #   ❌ chrome119+ blocked (Truth Social's web client appears to expect
+        #      a ~Chrome 116 fingerprint).
+        # Default to chrome116; env override allows safari17_0 fallback.
+        self.impersonate = (
+            impersonate
+            or os.environ.get("TRUTH_SOCIAL_IMPERSONATE", "chrome116")
+        )
+
+        # ── Source mode (P12-E.2) ─────────────────────────────────────
+        # "direct" = call Truth Social directly via curl_cffi (works on
+        #            residential / Azure IPs only).
+        # "gcs"    = read the latest.json snapshot that an external
+        #            publisher (GitHub Actions, etc.) has written. Required
+        #            on Cloud Run since Cloudflare blocks GCP IPs.
+        env_source = os.environ.get("TRUTH_SOCIAL_SOURCE", "direct").lower()
+        chosen: Literal["direct", "gcs"] = (
+            source if source is not None else ("gcs" if env_source == "gcs" else "direct")
+        )
+        self.source: Literal["direct", "gcs"] = chosen
+        self.gcs_bucket = (
+            gcs_bucket
+            or os.environ.get("TRUTH_SOCIAL_GCS_BUCKET", "anomaly-truthsocial")
+        )
+        self.gcs_prefix = (
+            gcs_prefix
+            or os.environ.get("TRUTH_SOCIAL_GCS_PREFIX", "realDonaldTrump")
+        ).strip("/")
+
         # Allow tests to inject a mock client — external injection takes precedence.
         self._client = client
         self._owns_client = client is None
 
+        # gcs mode reuses a single storage.Client per process (lazy init).
+        self._gcs_client: Any = None
+
         self._last_seen_id: str | None = None
+
+        logger.info(
+            "TrumpCollector init: source=%s, impersonate=%s, "
+            "gcs=gs://%s/%s/latest.json",
+            self.source, self.impersonate, self.gcs_bucket, self.gcs_prefix,
+        )
 
     # ── Lifecycle ──────────────────────────────────────────────────
     async def aclose(self) -> None:
-        """Close only externally-owned clients. Injected ones are the caller's responsibility."""
+        """Close only externally-owned clients. Injected ones are the caller's responsibility.
+
+        curl_cffi.AsyncSession exposes async ``close()``. We also fall back
+        to ``aclose()`` so that httpx-style mock clients keep working.
+        """
         if self._owns_client and self._client is not None:
-            await self._client.aclose()
+            close_fn = getattr(self._client, "close", None)
+            try:
+                if close_fn is not None:
+                    result = close_fn()
+                    if asyncio.iscoroutine(result):
+                        await result
+                else:
+                    aclose_fn = getattr(self._client, "aclose", None)
+                    if aclose_fn is not None:
+                        await aclose_fn()
+            except Exception as e:  # noqa: BLE001 — best-effort close
+                logger.warning("TrumpCollector.aclose: client close failed: %s", e)
             self._client = None
 
     async def __aenter__(self) -> TrumpCollector:
@@ -298,7 +394,26 @@ class TrumpCollector:
         exclude_replies: bool = True,
         exclude_reblogs: bool = False,
     ) -> list[dict[str, Any]]:
-        """Single GET to /api/v1/accounts/{id}/statuses with retry."""
+        """Return one page of raw Mastodon status dicts.
+
+        Two source modes:
+          · "direct" — GET /api/v1/.../statuses via curl_cffi.
+          · "gcs"    — read gs://<bucket>/<prefix>/latest.json (max_id
+                      pagination is not available, so backfill must use
+                      "direct").
+        """
+        if self.source == "gcs":
+            if max_id is not None:
+                raise NotImplementedError(
+                    "gcs source does not support max_id pagination — "
+                    "use source='direct' for backfill",
+                )
+            return await self._get_page_from_gcs(
+                limit=limit,
+                exclude_replies=exclude_replies,
+                exclude_reblogs=exclude_reblogs,
+            )
+
         url = self.host + _STATUSES_PATH.format(account_id=self.account_id)
         params: dict[str, Any] = {
             "limit": int(limit),
@@ -317,12 +432,12 @@ class TrumpCollector:
             stop=stop_after_attempt(4),
             wait=wait_exponential(multiplier=2.0, min=5, max=60),
             retry=retry_if_exception_type(
-                (httpx.HTTPError, TruthSocialApiError),
+                (CurlRequestException, TruthSocialApiError),
             ),
             reraise=True,
         ):
             with attempt:
-                resp = await client.get(url, params=params)
+                resp = await client.get(url, params=params, timeout=self.timeout_s)
                 if resp.status_code >= 500 or resp.status_code == 429:
                     raise TruthSocialApiError(
                         f"truth_social api {resp.status_code} on {url}: "
@@ -348,19 +463,120 @@ class TrumpCollector:
         # Unreachable due to tenacity reraise=True — listed for the type checker.
         return []
 
-    async def _ensure_client(self) -> httpx.AsyncClient:
-        """Lazy create httpx.AsyncClient (only once per collector lifetime)."""
+    async def _ensure_client(self) -> AsyncSession:
+        """Lazy create curl_cffi.requests.AsyncSession.
+
+        ``impersonate=`` is what unlocks Cloudflare — it mimics the TLS
+        ClientHello + HTTP/2 SETTINGS frame of a real Chrome browser so
+        the request is not flagged as a bot. The User-Agent header is
+        still set as belt-and-suspenders, but impersonate operates at a
+        deeper layer.
+        """
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout_s, connect=10.0),
+            # Headers mirror the actual Truth Social web client. impersonate
+            # covers TLS+HTTP/2 layers; these headers align the application
+            # layer, lowering Cloudflare's bot score.
+            self._client = AsyncSession(
+                impersonate=self.impersonate,
                 headers={
                     "User-Agent": self.user_agent,
-                    "Accept": "application/json",
+                    "Accept": "application/json, text/plain, */*",
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
+                    "Referer": f"{self.host}/",
+                    "Origin": self.host,
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-origin",
                 },
-                follow_redirects=True,
+                timeout=self.timeout_s,
             )
         return self._client
+
+    # ── Private — GCS source plumbing (P12-E.2) ────────────────────
+    async def _get_page_from_gcs(
+        self,
+        *,
+        limit: int,
+        exclude_replies: bool,
+        exclude_reblogs: bool,
+    ) -> list[dict[str, Any]]:
+        """Read gs://<bucket>/<prefix>/latest.json and return its `posts`.
+
+        latest.json schema (produced by tools/truthsocial_publisher/main.py):
+            {
+              "fetched_at": "...",
+              "source": "...",
+              "account_id": "...",
+              "posts": [ <raw Mastodon status>, ... ]   # most-recent first
+            }
+
+        ``google-cloud-storage`` is a sync library, so the blocking call is
+        wrapped in ``asyncio.to_thread`` to keep the event loop responsive.
+        """
+        bucket = self.gcs_bucket
+        path = f"{self.gcs_prefix}/latest.json"
+
+        def _blocking_read() -> bytes:
+            client = self._ensure_gcs_client()
+            blob = client.bucket(bucket).blob(path)
+            return blob.download_as_bytes()
+
+        try:
+            raw_bytes = await asyncio.to_thread(_blocking_read)
+        except Exception as e:  # noqa: BLE001 — best-effort GCS read
+            logger.warning(
+                "truth_social GCS read failed (bucket=%s, path=%s): %s",
+                bucket, path, e,
+            )
+            return []
+
+        try:
+            envelope = json.loads(raw_bytes)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "truth_social GCS latest.json is not valid JSON: %s", e,
+            )
+            return []
+
+        posts = envelope.get("posts") if isinstance(envelope, dict) else None
+        if not isinstance(posts, list):
+            logger.warning(
+                "truth_social GCS latest.json missing 'posts' list "
+                "(envelope keys=%s)",
+                list(envelope.keys()) if isinstance(envelope, dict) else "?",
+            )
+            return []
+
+        # Apply the same filter/limit semantics the Mastodon API would,
+        # but on the client side now.
+        filtered = []
+        for raw in posts:
+            if not isinstance(raw, dict):
+                continue
+            if exclude_replies and raw.get("in_reply_to_id"):
+                continue
+            if exclude_reblogs and raw.get("reblog"):
+                continue
+            filtered.append(raw)
+            if len(filtered) >= limit:
+                break
+
+        fetched_at = envelope.get("fetched_at") if isinstance(envelope, dict) else "?"
+        logger.debug(
+            "truth_social GCS read ok — posts=%d (filtered=%d), fetched_at=%s",
+            len(posts), len(filtered), fetched_at,
+        )
+        return filtered
+
+    def _ensure_gcs_client(self) -> Any:
+        """Lazy ``storage.Client`` — cached per process (heavy to construct)."""
+        if self._gcs_client is None:
+            # Lazy import so "direct" mode users don't pay the import cost.
+            from google.cloud import storage  # type: ignore
+
+            self._gcs_client = storage.Client()
+        return self._gcs_client
 
 
 __all__ = [

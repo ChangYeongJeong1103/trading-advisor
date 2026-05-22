@@ -79,12 +79,12 @@ The internal structure of the anomaly subsystem. Each box is a code module
 (folder) with a single responsibility.
 
 ```
-                          ┌──────────────────────────────┐
-                          │       Config / Secrets       │
-                          │  API keys, thresholds, watch │
-                          │     list, feature flags      │
-                          └──────────────┬───────────────┘
-                                         │
+                    ┌──────────────────────────────┐
+                    │       Config / Secrets       │
+                    │  API keys, thresholds, watch │
+                    │     list, feature flags      │
+                    └──────────────┬───────────────┘
+                                   │
 ┌────────────────────────────────────────────────────────────────────────┐
 │                           Channel Modules                              │
 │                                                                        │
@@ -133,7 +133,7 @@ The internal structure of the anomaly subsystem. Each box is a code module
                                │   ChannelSignal
                                ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                              Core Engine                               │
+│                         Core Engine                                    │
 │                                                                        │
 │  1) Per-channel anomaly evaluator     (already done in the detector)   │
 │  2) Cross-channel confirmation engine (fusion_engine)                  │
@@ -158,8 +158,8 @@ The internal structure of the anomaly subsystem. Each box is a code module
 │                                                                        │
 │  - Terminal / log (sink for development / debugging, NOT a user UI)    │
 └────────────────────────────────────────────────────────────────────────┘
-                       (Streamlit dashboard is out of v1 scope — to be
-                        absorbed by v2 as part of the comprehensive trading advisor)
+     (Streamlit dashboard is out of v1 scope — to be
+          absorbed by v2 as part of the comprehensive trading advisor)
 ```
 
 ### 2.1 Component responsibility (per component)
@@ -640,23 +640,23 @@ Baseline during P1–P8 walking skeleton:
 
 ```
    ┌──────────────────────────────────────────────────┐
-   │  Step 1.  tier_floor = max(per_channel_tiers)    │   ← max-tier-wins
+   │  Step 1.  tier_floor = max(per_channel_tiers)    │ ← max-tier-wins
    └────────────────────────┬─────────────────────────┘
                             │
                             ▼
-   ┌──────────────────────────────────────────────────┐
+   ┌───────────────────────────────────────────────────┐
    │  Step 2.  Boost rule (corroboration → +1 tier)    │
-   │                                                  │
-   │   - tier_floor = WATCH                           │
-   │     AND ≥ 2 channels at WATCH+ (same direction)  │
-   │     → boost to RISK_OFF                          │
-   │                                                  │
-   │   - tier_floor = RISK_OFF                        │
+   │                                                   │
+   │ - tier_floor = WATCH                              │
+   │   AND ≥ 2 channels at WATCH+ (same direction)     │
+   │   → boost to RISK_OFF                             │
+   │                                                   │
+   │ - tier_floor = RISK_OFF                           │
    │     AND ≥ 2 channels at RISK_OFF+ (same direction)│
-   │     → boost to EMERGENCY                         │
-   │                                                  │
-   │   - tier_floor = EMERGENCY → unchanged (already top) │
-   └────────────────────────┬─────────────────────────┘
+   │   → boost to EMERGENCY                            │
+   │                                                   │
+   │ - tier_floor = EMERGENCY → unchanged (already top)│
+   └────────────────────────┬──────────────────────────┘
                             │
                             ▼
                   decide candidate_state

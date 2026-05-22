@@ -1,0 +1,4 @@
+# Minimal deps for the GitHub-Actions Truth Social publisher.
+# Pin versions for reproducibility in CI — bumped only when needed.
+curl_cffi>=0.7.0,<1.0.0       # Cloudflare-safe HTTP client (Chrome TLS fingerprint)
+google-cloud-storage>=2.14.0  # GCS upload

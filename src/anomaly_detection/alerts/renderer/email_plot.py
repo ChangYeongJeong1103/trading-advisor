@@ -583,6 +583,8 @@ def _plot_price_panel(
 
     Same as the price panel in the historical event plot: line + dots (small
     markers). If the price range is tiny, add a little ylim padding automatically.
+    Price is carried forward to NOW so sparse channels still look like a normal
+    market chart; volume remains based only on actual trades.
 
     Because each bar's ts is the bucket start time, adjust the X position to the
     bucket center (= ts + bucket_minutes/2). With bucket_minutes=1 this differs
@@ -601,6 +603,12 @@ def _plot_price_panel(
         closes.append(b.close * 100.0 if is_polymarket else b.close)
 
     if offs:
+        if offs[-1] < data_xlim_max:
+            # Market charts keep the last observed price until the next trade.
+            # Do not do this for volume; only price gets a synthetic NOW point.
+            offs.append(data_xlim_max)
+            closes.append(closes[-1])
+
         ax.plot(
             offs, closes,
             color="#1f77b4", linewidth=1.6, alpha=0.95,

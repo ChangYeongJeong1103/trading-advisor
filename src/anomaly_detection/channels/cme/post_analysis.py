@@ -415,9 +415,13 @@ def _calc_vpin(df: pd.DataFrame, *, n_buckets: int) -> float:
     if bucket_size <= 0:
         return 0.0
 
-    # split buy / sell volumes (vectorized)
-    buy_vol = df.loc[df["side"] == "B", "size"].astype(float)
-    sell_vol = df.loc[df["side"] == "A", "size"].astype(float)
+    # Databento MDP3 aggressor side convention (matches live_streamer.py L425
+    # and cme_insider_scanner.py L590-593):
+    #   side='A' = trade on Ask  → buyer was the aggressor   → buy_vol
+    #   side='B' = trade on Bid  → seller was the aggressor  → sell_vol
+    #   side='N' = unknown / non-trade                       → split 50/50 below
+    buy_vol = df.loc[df["side"] == "A", "size"].astype(float)
+    sell_vol = df.loc[df["side"] == "B", "size"].astype(float)
     unk_vol = df.loc[df["side"] == "N", "size"].astype(float)
 
     # 'N' is split half/half (simplification — a more rigorous approach is the Lee-Ready algorithm)
@@ -435,10 +439,11 @@ def _calc_vpin(df: pd.DataFrame, *, n_buckets: int) -> float:
         sz = float(row["size"])
         side = row["side"]
 
-        if side == "B":
-            bucket_b += sz
-        elif side == "A":
-            bucket_s += sz
+        # 'A' = buy-aggressor, 'B' = sell-aggressor (Databento MDP3 convention)
+        if side == "A":
+            bucket_b += sz                        # buy bucket
+        elif side == "B":
+            bucket_s += sz                        # sell bucket
         else:                                     # 'N' — half/half
             bucket_b += sz * 0.5
             bucket_s += sz * 0.5
@@ -470,8 +475,10 @@ def _calc_side_imbalance(df: pd.DataFrame) -> float:
     if len(df) == 0 or "size" not in df.columns or "side" not in df.columns:
         return 0.5
 
-    buy = float(df.loc[df["side"] == "B", "size"].sum())
-    sell = float(df.loc[df["side"] == "A", "size"].sum())
+    # Databento MDP3 convention: 'A' = buy-aggressor, 'B' = sell-aggressor
+    # (see live_streamer.py L425 and cme_insider_scanner.py L590-593).
+    buy = float(df.loc[df["side"] == "A", "size"].sum())
+    sell = float(df.loc[df["side"] == "B", "size"].sum())
     unk = float(df.loc[df["side"] == "N", "size"].sum())
     # 'N' half split
     buy += unk * 0.5

@@ -15,6 +15,11 @@ requests                # X post publisher (sync HTTP inside asyncio.to_thread)
 requests-oauthlib       # X OAuth1 signing for POST /2/tweets
 tenacity                # exponential backoff + circuit breaker (D4)
 aiohttp                 # HTTP health server for Cloud Run probe (entrypoint)
+# Truth Social sits behind Cloudflare; plain httpx requests get JA3/TLS
+# fingerprinted and rejected with 403 "Just a moment..." (Cloudflare challenge).
+# curl_cffi impersonates a real Chrome TLS+HTTP/2 fingerprint so the Truth
+# Social collector can pass Cloudflare (P12-E TruthSocial fetch recovery, 2026-05-22).
+curl_cffi               # Cloudflare-safe HTTP client (Truth Social collector)
 
 # ---------- Data / storage ----------
 pandas                  # in-memory rolling window
