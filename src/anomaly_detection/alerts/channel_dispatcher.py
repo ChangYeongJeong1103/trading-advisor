@@ -66,6 +66,11 @@ from ..calendar import (
 from ..core.schemas import ChannelSignal, Tier
 from .alert_ohlc_buffer import AlertOhlcBuffer
 from .cooldown import ChannelAlertCooldown
+from .health_alert import (
+    HealthAlertCooldown,
+    SystemHealthAlert,
+    render_health_email,
+)
 from .live_timeline import LiveTimelineBuffer
 from .llm_assessor import AlertAssessment, LLMAlertAssessor
 from .renderer.channel_email import (
@@ -162,6 +167,12 @@ class ChannelAlertDispatcher:
         self._out_root = out_root
         self._out_root.mkdir(parents=True, exist_ok=True)
 
+        # ── P12-F: System health alert (email-only) ────────────────
+        # Completely separate from the market ChannelSignal path. Never
+        # reaches Telegram / X — dispatch_health_alert() only calls send_email.
+        # 24h self-managed cooldown to prevent storms of identical alerts.
+        self._health_cooldown = HealthAlertCooldown()
+
         # Audit counters — to be exposed via a future health endpoint.
         # email/telegram are counted separately (telegram is always ≤ email).
         self._stats: dict[str, int] = {
@@ -182,6 +193,11 @@ class ChannelAlertDispatcher:
             # actually got a result and made it into the email.
             "llm_assess_attempted": 0,
             "llm_assess_succeeded": 0,
+            # P12-F: System health alert path (email-only).
+            "health_considered": 0,        # dispatch_health_alert() call count
+            "health_emitted": 0,           # email actually sent
+            "health_suppressed_cooldown": 0,
+            "health_errors": 0,
         }
 
     @property
@@ -580,6 +596,70 @@ class ChannelAlertDispatcher:
             len(sent.tweets),
         )
         return sent
+
+    # ─────────────────────────────────────────────────────────────────
+    # P12-F: System health alert — email-only path
+    # ─────────────────────────────────────────────────────────────────
+    async def dispatch_health_alert(
+        self,
+        alert: SystemHealthAlert,
+    ) -> SentEmail | None:
+        """SystemHealthAlert → 1 email.
+
+        Completely separate from the ChannelSignal pipeline:
+            · Own cooldown (HealthAlertCooldown).
+            · Never reaches Telegram / X branches at all.
+            · No heavy LLM assessment / plot rendering — health email is plain HTML.
+
+        Args:
+            alert: the health event to dispatch.
+
+        Returns:
+            SentEmail (or dry-run capture). None if cooldown blocked or rendering
+            / sending failed.
+        """
+        self._stats["health_considered"] += 1
+
+        if not self._health_cooldown.should_send(alert):
+            self._stats["health_suppressed_cooldown"] += 1
+            logger.info(
+                "channel_dispatcher: health SUPPRESS (cooldown) "
+                "component=%s kind=%s",
+                alert.component, alert.kind.value,
+            )
+            return None
+
+        try:
+            rendered = render_health_email(alert)
+        except Exception as exc:  # noqa: BLE001
+            self._stats["health_errors"] += 1
+            logger.exception(
+                "channel_dispatcher: health RENDER failed component=%s kind=%s — %s",
+                alert.component, alert.kind.value, exc,
+            )
+            return None
+
+        try:
+            meta = await send_email(rendered, self._smtp)
+        except Exception as exc:  # noqa: BLE001
+            self._stats["health_errors"] += 1
+            logger.exception(
+                "channel_dispatcher: health SEND failed component=%s kind=%s "
+                "alert_id=%s — %s",
+                alert.component, alert.kind.value, rendered.alert_id, exc,
+            )
+            return None
+
+        self._stats["health_emitted"] += 1
+        logger.info(
+            "channel_dispatcher: emit HEALTH component=%s kind=%s dry_run=%s "
+            "alert_id=%s",
+            alert.component,
+            alert.kind.value,
+            meta.dry_run,
+            rendered.alert_id,
+        )
+        return meta
 
 
 # ── Backward-compat alias (preserves the P11(a) ChannelEmailDispatcher import) ──

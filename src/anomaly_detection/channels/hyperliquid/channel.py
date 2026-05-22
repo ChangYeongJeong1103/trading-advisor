@@ -259,11 +259,16 @@ class HyperliquidChannel(Channel):
             cycle_start = asyncio.get_event_loop().time()
             try:
                 await self._poll_once()
+                # P12-F: if the whole cycle finished without raising, the core
+                # fetch succeeded. Best-effort sub-steps (recentTrades etc.)
+                # are wrapped in their own try/except inside _poll_once.
+                self._record_fetch_ok()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 # A single cycle failure must not block the next cycle
                 logger.exception("HyperliquidChannel: poll_once failed: %s", e)
+                self._record_fetch_fail(e)
 
             # Wait until the next cycle — wakes immediately on stop signal
             elapsed = asyncio.get_event_loop().time() - cycle_start

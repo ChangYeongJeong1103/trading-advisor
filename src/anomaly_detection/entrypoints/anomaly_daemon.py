@@ -87,6 +87,7 @@ from ..core.schemas import (
 )
 from ..core.state_manager import StateManager
 from ..monitoring.health import HealthRegistry
+from ..monitoring.weekly_digest import weekly_digest_loop
 from ..monitoring.metrics import MetricRegistry
 from ..storage.decision_store import DecisionStore
 from ..storage.feature_store import FeatureStore
@@ -612,10 +613,14 @@ class AnomalyDaemon:
                 # v1 is single-account (Trump) only — use the collector default as-is.
                 # Other watchlist accounts arrive in v2 when multi-account is supported.
                 ts_accounts = self.config.watchlist.truth_social_accounts or ["realDonaldTrump"]
+                # P12-F: inject the email-only health callback so that consecutive
+                # fetch failures / recoveries page via the dispatcher's
+                # dispatch_health_alert path (never Telegram / X).
                 ch_truth = TruthSocialChannel(
                     openai_api_key=openai_key,
                     raw_store=self.raw_store,
                     enable_embedding=True,
+                    health_alert_cb=self.channel_dispatcher.dispatch_health_alert,
                 )
                 self.registry.register(ch_truth)
                 logger.info(
@@ -663,7 +668,25 @@ class AnomalyDaemon:
                 self.streamer_health.run(), name="streamer-health",
             ))
 
-        # 5) HTTP health server (Cloud Run requires PORT listen)
+        # 5) P12-F Weekly health digest — Mon 06:00 PT, one summary email of
+        #    every registered component. Disable with HEALTH_ALERTS_ENABLED=false.
+        if os.environ.get("HEALTH_ALERTS_ENABLED", "true").lower() != "false":
+            self._tasks.append(asyncio.create_task(
+                weekly_digest_loop(
+                    registry=self.health,
+                    dispatch_health_alert=self.channel_dispatcher.dispatch_health_alert,
+                    channels=dict(zip(self.registry.names(), self.registry.all())),
+                    timezone_name=os.environ.get(
+                        "WEEKLY_HEALTH_DIGEST_TZ", "America/Los_Angeles",
+                    ),
+                ),
+                name="weekly-health-digest",
+            ))
+            logger.info("weekly_health_digest_enabled")
+        else:
+            logger.info("weekly_health_digest_disabled")
+
+        # 6) HTTP health server (Cloud Run requires PORT listen)
         await self._start_http_server()
 
         logger.info("daemon_started",

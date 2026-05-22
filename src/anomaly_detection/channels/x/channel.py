@@ -304,7 +304,15 @@ class XChannel(Channel):
 
         Callable from outside (e.g. tests) — verifies one cycle without start().
         """
-        posts = await self._collector.fetch_recent_posts()
+        # P12-F: surface fetch attempt success/fail to weekly_digest. The
+        # outer _poll_loop already catches exceptions, but we mark explicitly
+        # so the digest distinguishes "fetch never tried" from "fetch failed".
+        try:
+            posts = await self._collector.fetch_recent_posts()
+        except Exception as e:
+            self._record_fetch_fail(e)
+            raise
+        self._record_fetch_ok()
         if not posts:
             return
 

@@ -45,8 +45,9 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import ClassVar, Deque
+from typing import Awaitable, Callable, ClassVar, Deque
 
+from ...alerts.health_alert import HealthAlertKind, SystemHealthAlert
 from ...core.schemas import (
     CHANNEL_TRUTH_SOCIAL,
     ChannelSignal,
@@ -58,6 +59,9 @@ from .collector import TrumpCollector
 from .llm_scorer import MarketImpactScore, TruthSocialLLMScorer
 from .normalize import TruthPost
 from .reference_db import TruthSocialReferenceDB
+
+# Callback signature — kept compatible with dispatcher.dispatch_health_alert.
+HealthAlertCallback = Callable[[SystemHealthAlert], Awaitable[object]]
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,12 @@ class TruthSocialChannel(Channel):
         sticky_window_s: ChannelSignal validity window (default 1800 = 30 min).
         dedupe_capacity: seen post_id cache size (default 1024).
         enable_embedding: enable ReferenceDB Stage 2 embedding.
+        health_alert_cb: P12-F. Async callback fired on consecutive fetch fail
+            / recovery. Typically `ChannelAlertDispatcher.dispatch_health_alert`.
+            None → no ops-health alerting (silent fail possible — fine for tests).
+        fail_alert_threshold: number of consecutive fail cycles before firing a
+            REACTIVE_FAIL alert. With poll_interval=300s × 5 = 25 min — absorbs
+            short Cloudflare hiccups before paging.
 
     Raises:
         RuntimeError: when constructed without an openai key (scorer fails immediately).
@@ -104,6 +114,8 @@ class TruthSocialChannel(Channel):
         sticky_window_s: float = _DEFAULT_STICKY_WINDOW_S,
         dedupe_capacity: int = 1024,
         enable_embedding: bool = True,
+        health_alert_cb: HealthAlertCallback | None = None,
+        fail_alert_threshold: int = 5,
     ) -> None:
         # ── Reference DB ─────────────────────────────────────────────
         if reference_db is None:
@@ -145,11 +157,26 @@ class TruthSocialChannel(Channel):
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
 
+        # ── P12-F: Reactive health alerting ──────────────────────────
+        # Consecutive fetch-fail counter — incremented by _poll_once when the
+        # collector raises, reset on a successful cycle. Once it crosses the
+        # threshold, one REACTIVE_FAIL alert is dispatched (dispatcher cooldown
+        # then mutes repeats); recovery sends one REACTIVE_RECOVERY.
+        self._health_alert_cb = health_alert_cb
+        self._fail_alert_threshold = max(1, int(fail_alert_threshold))
+        self._consecutive_fetch_failures: int = 0
+        self._first_fail_ts: datetime | None = None
+        self._last_fail_error: str = ""
+        self._fail_alert_active: bool = False  # already paged for the current outage?
+
         logger.info(
             "TruthSocialChannel: initialized "
-            "(model=%s, poll=%.0fs, sticky=%.0fs, embedding=%s)",
+            "(model=%s, poll=%.0fs, sticky=%.0fs, embedding=%s, "
+            "health_alert=%s, fail_threshold=%d)",
             model, self._poll_interval_s, self._sticky_window_s,
             enable_embedding,
+            "on" if health_alert_cb is not None else "off",
+            self._fail_alert_threshold,
         )
 
     # ─────────────────────────────────────────────────────────────────
@@ -267,7 +294,12 @@ class TruthSocialChannel(Channel):
             posts = await self._collector.fetch_recent(limit=_DEFAULT_FETCH_LIMIT)
         except Exception as e:  # noqa: BLE001 — collector exception
             logger.warning("TruthSocialChannel: fetch_recent failed: %s", e)
+            await self._record_fetch_failure(error=e)
             return
+
+        # Fetch succeeded — clear the fail streak; if we had already paged for
+        # an outage, also dispatch a one-shot recovery notice.
+        await self._record_fetch_success()
 
         if not posts:
             return
@@ -363,3 +395,88 @@ class TruthSocialChannel(Channel):
     def _update_last_event_ts(self, post: TruthPost) -> None:
         if self._last_event_ts is None or post.created_at > self._last_event_ts:
             self._last_event_ts = post.created_at
+
+    # ─────────────────────────────────────────────────────────────────
+    # P12-F: Reactive health monitor
+    # ─────────────────────────────────────────────────────────────────
+    async def _record_fetch_failure(self, *, error: BaseException) -> None:
+        """Record a 1-cycle fetch failure; page on threshold (REACTIVE_FAIL).
+
+        Once `_fail_alert_active` flips to True the dispatcher's 24h cooldown
+        suppresses repeats. After recovery, a new outage resets `first_fail_ts`
+        and can page again.
+
+        Also propagates to the base-class fetch_health used by weekly_digest.
+        """
+        self._record_fetch_fail(error)  # P12-F: update base fetch_health snapshot
+        self._consecutive_fetch_failures += 1
+        self._last_fail_error = f"{type(error).__name__}: {error!s}"[:500]
+        if self._first_fail_ts is None:
+            self._first_fail_ts = datetime.now(timezone.utc)
+
+        if (
+            self._consecutive_fetch_failures < self._fail_alert_threshold
+            or self._fail_alert_active
+            or self._health_alert_cb is None
+        ):
+            return
+
+        alert = SystemHealthAlert(
+            kind=HealthAlertKind.REACTIVE_FAIL,
+            component=f"channel.{CHANNEL_TRUTH_SOCIAL}",
+            message=(
+                f"Truth Social fetch failed "
+                f"{self._consecutive_fetch_failures} cycles in a row "
+                f"(≈{self._consecutive_fetch_failures * self._poll_interval_s / 60:.0f} min). "
+                f"Check publisher cron + GCS bucket."
+            ),
+            since=self._first_fail_ts or datetime.now(timezone.utc),
+            consecutive_failures=self._consecutive_fetch_failures,
+            detail=self._last_fail_error,
+        )
+        try:
+            await self._health_alert_cb(alert)
+        except Exception as cb_err:  # noqa: BLE001 — alert path is best-effort
+            logger.exception(
+                "TruthSocialChannel: health_alert_cb (FAIL) raised — %s", cb_err,
+            )
+            return
+        self._fail_alert_active = True
+        logger.warning(
+            "TruthSocialChannel: REACTIVE_FAIL alert dispatched "
+            "(consecutive=%d, first_fail=%s)",
+            self._consecutive_fetch_failures,
+            self._first_fail_ts.isoformat() if self._first_fail_ts else "—",
+        )
+
+    async def _record_fetch_success(self) -> None:
+        """Reset counters; if we had already paged, send a one-shot recovery.
+
+        Also propagates 'ok' to the base-class fetch_health used by weekly_digest.
+        """
+        self._record_fetch_ok()  # P12-F: update base fetch_health snapshot
+        had_failures = self._consecutive_fetch_failures > 0
+        was_alert_active = self._fail_alert_active
+
+        self._consecutive_fetch_failures = 0
+        self._first_fail_ts = None
+        self._last_fail_error = ""
+        self._fail_alert_active = False
+
+        if not (had_failures and was_alert_active and self._health_alert_cb):
+            return
+
+        alert = SystemHealthAlert(
+            kind=HealthAlertKind.REACTIVE_RECOVERY,
+            component=f"channel.{CHANNEL_TRUTH_SOCIAL}",
+            message="Truth Social fetch recovered — receiving posts again.",
+        )
+        try:
+            await self._health_alert_cb(alert)
+        except Exception as cb_err:  # noqa: BLE001
+            logger.exception(
+                "TruthSocialChannel: health_alert_cb (RECOVERY) raised — %s",
+                cb_err,
+            )
+            return
+        logger.info("TruthSocialChannel: REACTIVE_RECOVERY alert dispatched")

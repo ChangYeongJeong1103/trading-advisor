@@ -277,6 +277,13 @@ class PolymarketChannel(Channel):
 
         while not self._stop_event.is_set():
             cycle_start = asyncio.get_event_loop().time()
+            # P12-F: per-slug success/fail aggregated into channel fetch_health.
+            # 1 slug ok → 'ok'; all-fail cycle → 'fail'; skip-only cycle leaves
+            # the previous status untouched (so weekly_digest does not lock).
+            cycle_ok = 0
+            cycle_fail = 0
+            last_error: BaseException | None = None
+
             for slug in self._slugs:
                 if self._stop_event.is_set():
                     break
@@ -288,9 +295,12 @@ class PolymarketChannel(Channel):
 
                 try:
                     await self._poll_one(slug)
+                    cycle_ok += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    cycle_fail += 1
+                    last_error = e
                     # A single slug's failure must not block other slugs.
                     # Log throttling — so a slug timing out every cycle (5s) does
                     # not cause stack-trace floods:
@@ -314,6 +324,13 @@ class PolymarketChannel(Channel):
                             "PolymarketChannel: poll failed (suppressed) slug=%s n=%d",
                             slug, n,
                         )
+
+            # P12-F: 1+ slug ok → fetch_health='ok'; all-fail → 'fail'.
+            # Skip-only cycles leave fetch_health unchanged.
+            if cycle_ok > 0:
+                self._record_fetch_ok()
+            elif cycle_fail > 0 and last_error is not None:
+                self._record_fetch_fail(last_error)
 
             # Wait until the next cycle — wakes immediately on stop signal
             elapsed = asyncio.get_event_loop().time() - cycle_start

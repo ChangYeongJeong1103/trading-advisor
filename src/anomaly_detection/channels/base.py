@@ -39,10 +39,38 @@ Why polling model (instead of push):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
-from typing import ClassVar
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import ClassVar, Literal
 
 from ..core.schemas import ChannelSignal
+
+# P12-F: per-channel fetch status surfaced by the weekly health digest.
+#   ok      — the most recent fetch attempt succeeded.
+#   fail    — the most recent fetch attempt raised / returned 4xx/5xx.
+#   unknown — the channel has not attempted a fetch yet, or tracking is
+#             not wired into its poll loop yet.
+FetchStatus = Literal["ok", "fail", "unknown"]
+
+
+@dataclass(frozen=True)
+class ChannelFetchHealth:
+    """Snapshot of the channel's most recent fetch attempt (P12-F).
+
+    "fetch attempt" = one communication event with the upstream data source.
+        Polymarket: one REST trades-API call
+        Hyperliquid: one WS reconnect / REST snapshot
+        TruthSocial: one collector.fetch_recent (GCS read or direct)
+        X: one collector.fetch_recent_posts
+        CME: one streamer/poll cycle iteration
+
+    success / failure here is "did the communication itself succeed" — NOT
+    "was there fresh data". The weekly digest's job is to catch silent
+    failures (Cloudflare block, expired API key, etc.), not slow markets.
+    """
+    status: FetchStatus
+    last_attempt_at: datetime | None  # None right after boot
+    error: str = ""                   # populated only when status == 'fail'
 
 
 class Channel(ABC):
@@ -53,11 +81,25 @@ class Channel(ABC):
       - last_event_ts (property)
       - start() / stop() (async)
       - get_current_signal()
+
+    P12-F (opt-in): to populate fetch_health accurately, call the helpers
+    `_record_fetch_ok()` / `_record_fetch_fail()` from inside the channel's
+    poll loop try/except. Without these calls fetch_health stays 'unknown'.
     """
 
     # Override with one of schemas.CHANNEL_* constants in the subclass.
     # e.g.: class PolymarketChannel(Channel): name = CHANNEL_POLYMARKET
     name: ClassVar[str] = "abstract"
+
+    # ─────────────────────────────────────────────────────────────────
+    # P12-F: fetch health tracking — opt-in (channels call _record_fetch_*)
+    # ─────────────────────────────────────────────────────────────────
+    # Defaults — if a channel never calls _record_fetch_*, status stays
+    # 'unknown'. Used inside a single instance only; poll loops are single
+    # asyncio tasks so no race.
+    _last_fetch_status: FetchStatus = "unknown"
+    _last_fetch_at: datetime | None = None
+    _last_fetch_error: str = ""
 
     # ─────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -120,6 +162,48 @@ class Channel(ABC):
         Default implementation: always False. Subclasses should override with their internal flag.
         """
         return False
+
+    # ─────────────────────────────────────────────────────────────────
+    # P12-F: Fetch health helpers
+    # ─────────────────────────────────────────────────────────────────
+    def _record_fetch_ok(self) -> None:
+        """Channel calls this from its poll loop after a successful fetch.
+
+        Example:
+            try:
+                data = await self._collector.fetch_recent(...)
+            except Exception as e:
+                self._record_fetch_fail(e)
+                return
+            self._record_fetch_ok()
+        """
+        self._last_fetch_status = "ok"
+        self._last_fetch_at = datetime.now(timezone.utc)
+        self._last_fetch_error = ""
+
+    def _record_fetch_fail(self, error: BaseException | str) -> None:
+        """Channel calls this from the except branch of its poll loop.
+
+        error: stored as a truncated str() summary — surfaces in the weekly
+            digest email as a debugging hint.
+        """
+        self._last_fetch_status = "fail"
+        self._last_fetch_at = datetime.now(timezone.utc)
+        if isinstance(error, BaseException):
+            self._last_fetch_error = f"{type(error).__name__}: {error!s}"[:500]
+        else:
+            self._last_fetch_error = str(error)[:500]
+
+    def fetch_health(self) -> ChannelFetchHealth:
+        """Snapshot of the most recent fetch attempt — read by weekly_digest.
+
+        Default: 'unknown' until the channel records its first fetch attempt.
+        """
+        return ChannelFetchHealth(
+            status=self._last_fetch_status,
+            last_attempt_at=self._last_fetch_at,
+            error=self._last_fetch_error,
+        )
 
     # ─────────────────────────────────────────────────────────────────
     # Convenience

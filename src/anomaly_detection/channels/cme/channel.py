@@ -421,18 +421,32 @@ class CMEChannel(Channel):
 
         while not self._stop_event.is_set():
             cycle_start = asyncio.get_event_loop().time()
+            # P12-F: per-symbol success/fail aggregated into fetch_health.
+            # CME channel itself only does in-memory cleanup — the actual
+            # upstream fetch health lives in streamer_health_monitor.
+            cycle_ok = 0
+            cycle_fail = 0
+            last_error: BaseException | None = None
 
             for symbol in self._symbols:
                 if self._stop_event.is_set():
                     break
                 try:
                     self._poll_one(symbol, now_loop_time=cycle_start)
+                    cycle_ok += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    cycle_fail += 1
+                    last_error = e
                     logger.exception(
                         "CMEChannel: poll failed for symbol=%s: %s", symbol, e,
                     )
+
+            if cycle_ok > 0:
+                self._record_fetch_ok()
+            elif cycle_fail > 0 and last_error is not None:
+                self._record_fetch_fail(last_error)
 
             elapsed = asyncio.get_event_loop().time() - cycle_start
             sleep_s = max(0.1, self._poll_interval_s - elapsed)
