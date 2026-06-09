@@ -23,6 +23,7 @@ from config import (
     SIGMOID_MIDPOINT,
     SIGMOID_STEEPNESS,
     TOP_K_DOCUMENTS,
+    get_effective_llm_temperature,
 )
 from logging_utils import cost_tracker, experiment_tracker, logger, retry_on_api_error
 
@@ -37,6 +38,29 @@ This module contains:
 These functions are currently used by the Streamlit app and are designed so they
 can also be reused by other frontends in the future (e.g., FastAPI or CLI tools).
 """
+
+
+def create_llm(model_name: str, temperature: float) -> ChatOpenAI:
+    """
+    Create the chat model used by the advisor.
+
+    GPT-5 family models only accept the default temperature. For this RAG app,
+    use minimal reasoning effort so the interface stays responsive.
+    """
+    is_gpt5_family = model_name.lower().startswith("gpt-5")
+    effective_temperature = (
+        get_effective_llm_temperature(model_name)
+        if is_gpt5_family
+        else temperature
+    )
+    if is_gpt5_family:
+        return ChatOpenAI(
+            model=model_name,
+            temperature=effective_temperature,
+            model_kwargs={"reasoning_effort": "minimal"},
+        )
+
+    return ChatOpenAI(model=model_name, temperature=effective_temperature)
 
 
 class ConditionalRAGAdvisor:
@@ -73,8 +97,9 @@ class ConditionalRAGAdvisor:
         self.sigmoid_midpoint = sigmoid_midpoint
         self.sigmoid_steepness = sigmoid_steepness
 
-        # Initialize LLM
-        self.llm = ChatOpenAI(model=llm_model, temperature=temperature)
+        # Initialize LLM and cost tracking with the same model.
+        self.llm = create_llm(model_name=llm_model, temperature=temperature)
+        cost_tracker.set_model(llm_model)
 
         # Custom prompt for RAG chain: force using context documents
         rag_prompt_template = """

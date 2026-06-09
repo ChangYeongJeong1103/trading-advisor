@@ -17,13 +17,18 @@ load_dotenv()
 # ========================================
 import os
 
-# Get the directory of the current script (deploy folder)
+# Get the directory of the current script (src/market_summary/).
 _current_dir = os.path.dirname(os.path.abspath(__file__))
-# Set DOCS_FOLDER relative to the script's directory (parent directory -> data)
-DOCS_FOLDER: str = os.path.join(os.path.dirname(_current_dir), "data")
+# The RAG source PDFs live in <project-root>/data/market_summary/, both locally
+# and inside the container (Dockerfile copies them to /app/data/market_summary).
+# config.py sits in <project-root>/src/market_summary/, so go up TWO levels to
+# reach the project root, then into data/market_summary.
+_project_root = os.path.dirname(os.path.dirname(_current_dir))
+DOCS_FOLDER: str = os.path.join(_project_root, "data", "market_summary")
 
 # LLM model name (can be overridden via environment variable)
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# GPT-5-mini is the default for the Streamlit RAG interface.
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-5-mini")
 
 
 # ========================================
@@ -37,7 +42,22 @@ CHUNK_OVERLAP: int = 100     # Overlap between chunks (characters)
 TOP_K_DOCUMENTS: int = 4     # Number of documents to retrieve
 
 # 3️⃣ LLM Temperature
-LLM_TEMPERATURE: float = 0.2  # Lower = focused, Higher = creative
+# GPT-5 family models only accept their default temperature. This value is still
+# used when LLM_MODEL is an older model such as gpt-4o-mini.
+LLM_TEMPERATURE: float = 0.2  # Used only for older non-GPT-5 models.
+
+
+def get_effective_llm_temperature(model_name: str | None = None) -> float:
+    """
+    Return the temperature that will actually be sent to the OpenAI API.
+
+    GPT-5 family models only accept the default temperature, so the advisor
+    sends 1.0 for those models. Older models can still use LLM_TEMPERATURE.
+    """
+    selected_model = model_name or LLM_MODEL
+    if selected_model.lower().startswith("gpt-5"):
+        return 1.0
+    return LLM_TEMPERATURE
 
 
 # ========================================

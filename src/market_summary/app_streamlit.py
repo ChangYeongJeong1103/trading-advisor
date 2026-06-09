@@ -13,14 +13,14 @@ from config import (
     FALLBACK_THRESHOLD,
     LLM_CONFIDENCE_THRESHOLD,
     LLM_MODEL,
-    LLM_TEMPERATURE,
     OFF_TOPIC_THRESHOLD,
     RELEVANCE_THRESHOLD,
     SIGMOID_MIDPOINT,
     SIGMOID_STEEPNESS,
     TOP_K_DOCUMENTS,
+    get_effective_llm_temperature,
 )
-from document_pipeline import build_vectorstore_pipeline
+from document_pipeline import get_or_build_vectorstore
 from advisor import ConditionalRAGAdvisor, create_advisor, monitored_query
 from logging_utils import cost_tracker, experiment_tracker, logger
 
@@ -28,17 +28,18 @@ from logging_utils import cost_tracker, experiment_tracker, logger
 # ================================
 # 🔧 Utility: Cached initializers
 # ================================
-@st.cache_resource(show_spinner="🔄 Building vector store from documents... This runs only once.")
+@st.cache_resource(show_spinner="🔄 Loading vector store... This runs only once.")
 def get_vectorstore():
     """
-    Build (or rebuild) the ChromaDB vector store.
+    Load the persisted ChromaDB store if it exists, otherwise build it once.
 
-    This is cached by Streamlit, so it runs only once per session
-    unless the cache is cleared.
+    Cached by Streamlit, so it runs only once per server process (shared across
+    all sessions). Because we ship a prebuilt chroma_db, normal startups just
+    read it instead of re-embedding every PDF.
     """
     # You can change the persist directory if needed
     persist_dir = "chroma_db"
-    vectorstore = build_vectorstore_pipeline(
+    vectorstore = get_or_build_vectorstore(
         docs_folder=DOCS_FOLDER,
         persist_directory=persist_dir,
     )
@@ -75,7 +76,7 @@ def get_experiment_config() -> Dict[str, Any]:
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
         "top_k": TOP_K_DOCUMENTS,
-        "temperature": LLM_TEMPERATURE,
+        "temperature": get_effective_llm_temperature(),
         "relevance_threshold": RELEVANCE_THRESHOLD,
         "fallback_threshold": FALLBACK_THRESHOLD,
         "off_topic_threshold": OFF_TOPIC_THRESHOLD,
@@ -154,7 +155,10 @@ def main() -> None:
         st.write(f"- Chunk size: `{CHUNK_SIZE}`")
         st.write(f"- Chunk overlap: `{CHUNK_OVERLAP}`")
         st.write(f"- Top-K documents: `{TOP_K_DOCUMENTS}`")
-        st.write(f"- LLM temperature: `{LLM_TEMPERATURE}`")
+        temperature_display = f"{get_effective_llm_temperature()}"
+        if LLM_MODEL.lower().startswith("gpt-5"):
+            temperature_display += " (GPT-5 default)"
+        st.write(f"- LLM temperature: `{temperature_display}`")
 
         st.markdown("---")
         st.markdown("**System-level (Step 2)**")

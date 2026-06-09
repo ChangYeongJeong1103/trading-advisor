@@ -70,12 +70,22 @@ class CostTracker:
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     }
 
-    def __init__(self, model_name: str = "gpt-4o-mini") -> None:
+    def __init__(self, model_name: Optional[str] = None) -> None:
         """Initialize a cost tracker for a specific model."""
-        self.model_name = model_name
-        self.encoding = tiktoken.encoding_for_model(model_name)
+        model_name = model_name or os.getenv("LLM_MODEL", "gpt-5-mini")
+        self.set_model(model_name)
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+
+    def set_model(self, model_name: str) -> None:
+        """Update the model used for token counting and cost estimates."""
+        self.model_name = model_name
+        try:
+            self.encoding = tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            # New OpenAI models can appear before tiktoken knows their exact name.
+            # o200k_base is the modern OpenAI fallback encoding.
+            self.encoding = tiktoken.get_encoding("o200k_base")
 
     def count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""

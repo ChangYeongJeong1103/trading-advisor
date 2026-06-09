@@ -1,7 +1,9 @@
 streamlit
-langchain
-langchain-openai
-langchain-community
+# Pin langchain to the 0.2.x line. langchain 0.3+ removed `langchain.text_splitter`
+# and other modules this app imports, which breaks the build on a fresh install.
+langchain>=0.1.0,<0.3.0
+langchain-openai>=0.0.5,<0.3.0
+langchain-community>=0.0.10,<0.3.0
 chromadb
 tiktoken
 python-dotenv

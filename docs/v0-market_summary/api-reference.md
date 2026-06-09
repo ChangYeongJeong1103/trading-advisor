@@ -52,6 +52,6 @@ All hyperparameters are defined in `config.py`. See [hyperparameter-tuning.md](h
 | `FALLBACK_THRESHOLD` | 0.50 | Threshold for Smart Fallback mode. |
 | `OFF_TOPIC_THRESHOLD` | 0.15 | Threshold for off-topic rejection. |
 | `LLM_CONFIDENCE_THRESHOLD` | 5 | Minimum LLM confidence for answering. |
-| `LLM_MODEL` | "gpt-4o-mini" | OpenAI model used. |
+| `LLM_MODEL` | "gpt-5-mini" | OpenAI model used. |
 | `DOCS_FOLDER` | "data" | Directory containing financial reports (PDF/DOCX). |
 

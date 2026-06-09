@@ -85,7 +85,7 @@ graph TD
 ## v0.3  Tech stack
 
 - **Language**: Python 3.11
-- **LLM**: OpenAI GPT-4o-mini (configurable)
+- **LLM**: OpenAI GPT-5-mini (configurable)
 - **Vector DB**: ChromaDB
 - **Embeddings**: HuggingFace (`baconnier/Finance2_embedding_small_en-V1.5`)
 - **Frameworks**: LangChain, Streamlit

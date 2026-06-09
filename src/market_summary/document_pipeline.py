@@ -198,9 +198,74 @@ def build_vectorstore_pipeline(
     return vectorstore
 
 
+def load_existing_vectorstore(persist_directory: str = "chroma_db") -> Chroma:
+    """
+    Open a previously persisted ChromaDB store WITHOUT re-embedding documents.
+
+    Re-uses the embeddings on disk. We still build the embedding model because
+    Chroma needs it to embed the *query* at retrieval time (not the documents).
+
+    Args:
+        persist_directory: Folder that contains the chroma.sqlite3 store.
+
+    Returns:
+        A Chroma vector store backed by the existing on-disk data.
+    """
+    embeddings = create_embeddings_model()
+    vectorstore = Chroma(
+        persist_directory=persist_directory,
+        embedding_function=embeddings,
+    )
+    logger.info("♻️ Loaded existing Chroma store from %s (no re-embedding)", persist_directory)
+    return vectorstore
+
+
+def get_or_build_vectorstore(
+    docs_folder: str = DOCS_FOLDER,
+    persist_directory: str = "chroma_db",
+) -> Chroma:
+    """
+    Default entry point for the app: load the persisted store if it exists,
+    otherwise build it once from the source documents.
+
+    This matches the intended design — the chroma_db is created ahead of time
+    and shipped with the app, so normal startups just *read* it instead of
+    re-embedding every PDF on each cold start.
+
+    Args:
+        docs_folder: Source PDFs (only used when we have to build from scratch).
+        persist_directory: Where the Chroma store lives / will be created.
+
+    Returns:
+        A ready-to-use Chroma vector store.
+    """
+    # The presence of chroma.sqlite3 is our signal that a built store exists.
+    sqlite_path = os.path.join(persist_directory, "chroma.sqlite3")
+
+    if os.path.exists(sqlite_path):
+        try:
+            return load_existing_vectorstore(persist_directory)
+        except Exception as exc:  # noqa: BLE001
+            # Corrupt / version-mismatched store: fall back to a clean rebuild
+            # instead of crashing the whole app.
+            logger.warning(
+                "⚠️ Could not load existing Chroma store (%s). Rebuilding from documents.",
+                str(exc),
+            )
+
+    logger.info(
+        "🆕 No usable Chroma store at %s — building it from documents (one-time).",
+        persist_directory,
+    )
+    return build_vectorstore_pipeline(
+        docs_folder=docs_folder,
+        persist_directory=persist_directory,
+    )
+
+
 if __name__ == "__main__":
     # Simple manual test when running this file directly
-    vs = build_vectorstore_pipeline()
+    vs = get_or_build_vectorstore()
     print(vs)
 
 
