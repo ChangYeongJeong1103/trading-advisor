@@ -363,7 +363,19 @@ class AnomalyDaemon:
         x_post_enabled = bool(x_post_enabled_env) if x_post_enabled_env is not None else False
         x_post_dry_env = self._parse_bool(os.getenv("X_POST_DRY_RUN"))
         x_post_dry = bool(x_post_dry_env) if x_post_dry_env is not None else True
-        self.x_post_config = XPostConfig(enabled=x_post_enabled, dry_run=x_post_dry)
+        # X_POST_MIN_SCORE: 0-10. Even after passing the EMERGENCY gate, X
+        # posting is skipped when the LLM insider-trading suspicion score
+        # is below this value. Default = 7. Invalid values fall back to 7.
+        try:
+            x_post_min_score = int(os.getenv("X_POST_MIN_SCORE", "7"))
+        except ValueError:
+            x_post_min_score = 7
+        x_post_min_score = max(0, min(10, x_post_min_score))
+        self.x_post_config = XPostConfig(
+            enabled=x_post_enabled,
+            dry_run=x_post_dry,
+            min_score=x_post_min_score,
+        )
         self.x_post_credentials = XCredentials(
             api_key=config.secrets.x_api_key,
             api_key_secret=config.secrets.x_api_key_secret,
@@ -382,12 +394,15 @@ class AnomalyDaemon:
                     "(need OAuth1 or user-context bearer token)"
                 ),
             )
-            self.x_post_config = XPostConfig(enabled=False, dry_run=True)
+            self.x_post_config = XPostConfig(
+                enabled=False, dry_run=True, min_score=x_post_min_score,
+            )
         else:
             logger.info(
                 "x_auto_post_configured",
                 enabled=self.x_post_config.enabled,
                 dry_run=self.x_post_config.dry_run,
+                min_score=self.x_post_config.min_score,
                 auth_mode=(
                     "oauth1"
                     if self.x_post_credentials.has_oauth1
@@ -406,6 +421,13 @@ class AnomalyDaemon:
             # emails immediately. WATCH is only tracked via GCS audit + weekly_review.sh.
             # Only RISK_OFF and above go to inbox. WATCH routes to the 06:00 PT digest if enabled later.
             email_min_tier=Tier.RISK_OFF,
+            # User decision 2026-05-30: polymarket has too much noise so we
+            # accept EMERGENCY only for now. Detector threshold tuning is
+            # deferred. To restore RISK_OFF, simply remove the polymarket
+            # entry from this dict.
+            email_min_tier_overrides={
+                "polymarket": Tier.EMERGENCY,
+            },
             # P11(b).4 (lock 2026-04-23) — similarity score only on EMERGENCY.
             llm_assessor=self.llm_alert_assessor,
             x_post_config=self.x_post_config,
@@ -668,8 +690,12 @@ class AnomalyDaemon:
                 self.streamer_health.run(), name="streamer-health",
             ))
 
-        # 5) P12-F Weekly health digest — Mon 06:00 PT, one summary email of
-        #    every registered component. Disable with HEALTH_ALERTS_ENABLED=false.
+        # 5) P12-F Health digest — one summary email of every registered
+        #    component. Disable with HEALTH_ALERTS_ENABLED=false.
+        #    User decision 2026-05-30: while the codebase is still being
+        #    iterated heavily, run daily=True so the digest fires every
+        #    day at 06:00 PT. Switch back to daily=False for weekly
+        #    cadence (Mon 06:00 PT) once things stabilize.
         if os.environ.get("HEALTH_ALERTS_ENABLED", "true").lower() != "false":
             self._tasks.append(asyncio.create_task(
                 weekly_digest_loop(
@@ -679,12 +705,13 @@ class AnomalyDaemon:
                     timezone_name=os.environ.get(
                         "WEEKLY_HEALTH_DIGEST_TZ", "America/Los_Angeles",
                     ),
+                    daily=True,
                 ),
-                name="weekly-health-digest",
+                name="health-digest",
             ))
-            logger.info("weekly_health_digest_enabled")
+            logger.info("health_digest_enabled", cadence="daily")
         else:
-            logger.info("weekly_health_digest_disabled")
+            logger.info("health_digest_disabled")
 
         # 6) HTTP health server (Cloud Run requires PORT listen)
         await self._start_http_server()

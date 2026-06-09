@@ -83,7 +83,72 @@ async def weekly_digest_loop(
     hour: int = _DEFAULT_HOUR,
     minute: int = _DEFAULT_MINUTE,
     tick_seconds: float = _TICK_SECONDS,
+    daily: bool = False,
 ) -> None:
+    """Background task — health digest email loop (default weekly).
+
+    Args:
+        registry: HealthRegistry containing every component.
+        dispatch_health_alert: Usually `ChannelAlertDispatcher.dispatch_health_alert`.
+        channels: channel name → channel object. Used to enrich each
+            snapshot's last_event_age_seconds (registry alone may miss
+            channels). When None, only registry data is used.
+        timezone_name: IANA tz name. Default "America/Los_Angeles".
+        weekday: 0=Mon … 6=Sun. Default 0. Ignored when ``daily=True``.
+        hour / minute: dispatch time (in the given tz).
+        tick_seconds: how often the loop checks the dispatch time. 60s
+            is fine in production; tests can use a shorter value.
+        daily: When True, dispatch every day at hour:minute (weekday is
+            ignored). Default False (= weekly cadence on weekday/hour/minute).
+            User decision 2026-05-30: while the codebase is still being
+            iterated heavily, run daily; switch back to daily=False for
+            weekly cadence once things stabilize.
+
+    Cancellation:
+        Returns immediately on asyncio.CancelledError.
+    """
+    tz = ZoneInfo(timezone_name)
+    next_at = _next_run_at(
+        now=datetime.now(tz),
+        weekday=weekday, hour=hour, minute=minute, daily=daily,
+    )
+    cadence = "daily" if daily else "weekly"
+    logger.info(
+        "weekly_digest: started (%s cadence) — next run at %s (%s)",
+        cadence, next_at.isoformat(), timezone_name,
+    )
+
+    try:
+        while True:
+            now_local = datetime.now(tz)
+            if now_local >= next_at:
+                try:
+                    await _run_once(
+                        registry=registry,
+                        dispatch_health_alert=dispatch_health_alert,
+                        channels=channels or {},
+                        sent_at=now_local,
+                    )
+                except Exception as e:  # noqa: BLE001 — alert path best-effort
+                    logger.exception("weekly_digest: run failed — %s", e)
+
+                # Next dispatch — daily → tomorrow, weekly → next same weekday.
+                next_at = _next_run_at(
+                    now=now_local + timedelta(minutes=1),
+                    weekday=weekday,
+                    hour=hour,
+                    minute=minute,
+                    daily=daily,
+                )
+                logger.info(
+                    "weekly_digest: next run at %s (%s)",
+                    next_at.isoformat(), timezone_name,
+                )
+
+            await asyncio.sleep(tick_seconds)
+    except asyncio.CancelledError:
+        logger.info("weekly_digest: loop cancelled — shutting down")
+        raise
     """Background task — 매주 한 번 health digest 이메일 발송.
 
     Args:
@@ -150,21 +215,36 @@ def _next_run_at(
     weekday: int,
     hour: int,
     minute: int,
+    daily: bool = False,
 ) -> datetime:
-    """주어진 'now' (tz-aware) 다음에 오는 (weekday, hour:minute) 인스턴트.
+    """Next dispatch instant after ``now`` (tz-aware).
 
-    오늘이 해당 요일이고 현재 시각이 hour:minute 이전이면 "오늘" 반환. 아니면
-    다음 주 해당 요일.
+    ``daily=False`` (default): next (weekday, hour:minute) instant.
+        Returns "today" if today is the target weekday and ``now`` is
+        before hour:minute; otherwise the same weekday next week.
+
+    ``daily=True``: next (hour:minute) instant (weekday is ignored).
+        Returns "today" if hour:minute has not passed yet, otherwise
+        "tomorrow".
     """
     target_time = time(hour=hour, minute=minute)
     today_target = datetime.combine(now.date(), target_time, tzinfo=now.tzinfo)
 
+    if daily:
+        if now < today_target:
+            return today_target
+        return datetime.combine(
+            now.date() + timedelta(days=1),
+            target_time,
+            tzinfo=now.tzinfo,
+        )
+
     days_ahead = (weekday - now.weekday()) % 7
     if days_ahead == 0 and now < today_target:
-        # 오늘이 발송 요일 + 아직 발송 시각 전.
+        # Today is the dispatch weekday and we are still before hour:minute.
         return today_target
 
-    # 오늘 발송 요일 + 시각 지났거나, 다른 요일 — 다음 주기까지.
+    # Past the dispatch time today, or a different weekday — wait one cycle.
     if days_ahead == 0:
         days_ahead = 7
     return datetime.combine(

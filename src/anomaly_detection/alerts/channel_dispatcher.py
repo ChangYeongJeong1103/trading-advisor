@@ -141,6 +141,7 @@ class ChannelAlertDispatcher:
         telegram_config: TelegramConfig | None = None,
         telegram_emergency_only: bool = True,
         email_min_tier: Tier = Tier.RISK_OFF,
+        email_min_tier_overrides: dict[str, Tier] | None = None,
         scheduled_windows: tuple[ScheduledReleaseWindow, ...] | None = None,
         llm_assessor: LLMAlertAssessor | None = None,
         x_post_config: XPostConfig | None = None,
@@ -156,6 +157,14 @@ class ChannelAlertDispatcher:
         self._telegram = telegram_config
         self._telegram_emergency_only = telegram_emergency_only
         self._email_min_tier = email_min_tier
+        # Per-channel min_tier overrides. e.g. {"polymarket": Tier.EMERGENCY}
+        # makes the polymarket channel only emit email/telegram/X for
+        # EMERGENCY signals; other channels keep using self._email_min_tier.
+        # User decision 2026-05-30: polymarket has too much noise so we
+        # accept EMERGENCY only for now (detector threshold tuning later).
+        self._email_min_tier_overrides: dict[str, Tier] = (
+            dict(email_min_tier_overrides) if email_min_tier_overrides else {}
+        )
         self._scheduled_windows = (
             scheduled_windows
             if scheduled_windows is not None
@@ -187,6 +196,10 @@ class ChannelAlertDispatcher:
             "telegram_errors": 0,
             "x_post_emitted": 0,
             "x_post_skipped_tier": 0,
+            # Passed the EMERGENCY tier gate but the LLM suspicion score
+            # was below min_score (or llm_assessment was None, so score
+            # is unknown). Counted separately for visibility.
+            "x_post_skipped_score": 0,
             "x_post_errors": 0,
             # P11(b).4: LLM assessment stats. "attempted" = number of EMERGENCY
             # alerts where an LLM call was attempted, "succeeded" = number that
@@ -299,13 +312,20 @@ class ChannelAlertDispatcher:
             # the email send. WATCH is not stored in GCS audit and only occupies
             # cooldown state — when WATCH later escalates to RISK_OFF, the
             # cooldown's escalation rule will let it through normally.
-            if sig.tier.rank() < self._email_min_tier.rank():
+            #
+            # If a per-channel override exists (e.g. polymarket = EMERGENCY),
+            # use that value instead of the default self._email_min_tier
+            # (= RISK_OFF).
+            min_tier_for_channel = self._email_min_tier_overrides.get(
+                channel_name, self._email_min_tier,
+            )
+            if sig.tier.rank() < min_tier_for_channel.rank():
                 self._stats["email_skipped_tier"] += 1
                 logger.info(
                     "channel_dispatcher: email skip (tier<min) channel=%s "
                     "symbol=%s tier=%s min=%s",
                     channel_name, sig.symbol, sig.tier.value,
-                    self._email_min_tier.value,
+                    min_tier_for_channel.value,
                 )
                 continue
 
@@ -346,11 +366,26 @@ class ChannelAlertDispatcher:
                         self._stats["telegram_emitted"] += 1
                         result.telegrams.append(tg_capture)
 
-            # ── X auto-post (optional, EMERGENCY only) ──
+            # ── X auto-post (optional, EMERGENCY + score gate) ──
             # Best-effort, independent of email/telegram.
+            # Gate order:
+            #   1) tier == EMERGENCY passes
+            #   2) LLM insider-trading suspicion score >= min_score passes
+            #      (if llm_assessment is None the score is unknown → skip)
             if self.x_post_enabled:
+                min_score = self._x_post_config.min_score
                 if sig.tier != Tier.EMERGENCY:
                     self._stats["x_post_skipped_tier"] += 1
+                elif llm_assessment is None or llm_assessment.score < min_score:
+                    self._stats["x_post_skipped_score"] += 1
+                    logger.info(
+                        "x_post skipped (low score): channel=%s symbol=%s "
+                        "score=%s min_score=%d",
+                        channel_name,
+                        sig.symbol,
+                        "none" if llm_assessment is None else llm_assessment.score,
+                        min_score,
+                    )
                 else:
                     x_alert_id = alert_id or (
                         f"{channel_name}-{sig.symbol}-{sig.ts.strftime('%Y%m%dT%H%M%S')}"

@@ -50,6 +50,12 @@ class XPostConfig:
     enabled: bool = False
     dry_run: bool = True
     timeout_s: float = 20.0
+    # Minimum LLM suspicion score (0-10) required for X auto-posting.
+    # Even after passing the EMERGENCY tier gate, if the LLM
+    # insider-trading suspicion score is below this threshold, the
+    # post is skipped. Introduced to reduce X feed noise (default = 7).
+    # If llm_assessment is None (score unknown), we conservatively skip.
+    min_score: int = 7
 
 
 @dataclass(frozen=True)
