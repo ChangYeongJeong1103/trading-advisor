@@ -171,6 +171,17 @@ class PolymarketDetectorConfig:
     run_riskoff: int = 12
     run_emergency: int = 30
     dir_min_n: int = 5                # directional does NOT fire if n_trades_5min < 5
+    # P13 (user decision 2026-07-26): add a notional floor to directional_v1.
+    # It previously gated on trade COUNT only, with no dollar condition, so a
+    # run of dust-sized trades in a thin market went straight to RISK_OFF.
+    # Measured (July FOMC market, 2026-07-26): of the last 100 trades the
+    # median was $8 and 98 were under $100, totalling $2,666. A 17-trade run
+    # of that dust produced DIR_IMB RISK_OFF, which WC_BOOST then raised one
+    # step into EMERGENCY email + X posts (27 emails in 7 days).
+    # Every other detector already has a dollar condition (vol_burst $20k+,
+    # wallet concentration $5k). $10,000 is about a third of the historical
+    # insider cases (Maduro $33K, Iran $49.5K), so real signals still pass.
+    dir_min_total_usd: float = 10_000.0
     min_riskoff_detectors_for_emergency: int = 2
 
     # ── direction classification threshold (signal-level) ──
@@ -351,7 +362,13 @@ class PolymarketDetector:
         dir_score = 0.0
         dir_reason = ""
 
-        if n_trades >= c.dir_min_n:
+        # 5-minute total traded notional — floor that filters out dust runs.
+        dir_total_usd = (
+            float(f.get("buy_vol_usd_5min", 0.0))
+            + float(f.get("sell_vol_usd_5min", 0.0))
+        )
+
+        if n_trades >= c.dir_min_n and dir_total_usd >= c.dir_min_total_usd:
             abs_imb = abs(imbalance)
             dir_tier = self._directional_tier(abs_imb, run_len)
             dir_score = self._directional_score(abs_imb, run_len)

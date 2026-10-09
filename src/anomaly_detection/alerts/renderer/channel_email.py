@@ -81,14 +81,18 @@ from pathlib import Path
 # ── Local ─────────────────────────────────────────────────────────────
 from ..alert_ohlc_buffer import AlertOhlcBuffer
 from ..llm_assessor import AlertAssessment
+from ..llm_health import LLM_HEALTH
 from ..subject_template import build_alert_subject, channel_short
 from ...core.schemas import CHANNEL_TRUTH_SOCIAL, ChannelSignal, Tier
 from ...replay.schemas import ReplayResult
 from .channel_x_post import (
+    INSIDER_PATTERN_TAG_LABEL,
+    INSIDER_PATTERN_TAG_THRESHOLD,
     friendly_detector_list,
     render_analysis,
     render_detector_lines,
     render_footnote_parts,
+    shows_insider_pattern_tag,
     symbol_with_friendly,
 )
 from .email_plot import (
@@ -300,15 +304,27 @@ def render_email(
         )
         inline_images.append((plot_cid(win), plot_path))
 
-    # ── 2.5) truth_social branch: its own LLM scorer already computed
-    # insider_concern_score, so do not call LLMAlertAssessor again. Convert
-    # INSIDER_SUSPICION / INSIDER_NOTE / ANALYSIS from reason_codes directly into
-    # AlertAssessment and render it in the same "Insider-trading suspicion" row.
+    # ── 2.5) truth_social branch: its own LLM scorer already computed a
+    # market-impact score, so do not call LLMAlertAssessor again. Convert
+    # IMPACT_SCORE / INSIDER_NOTE / ANALYSIS from reason_codes directly into
+    # AlertAssessment and render it in the same "Market-impact" row.
     effective_assessment = llm_assessment
     if signal.channel == CHANNEL_TRUTH_SOCIAL and effective_assessment is None:
         effective_assessment = _assessment_from_truth_social_codes(
             list(signal.reason_codes),
         )
+
+    # ── 2.6) LLM outage banner (user decision 2026-08-09).
+    # An EMERGENCY with no assessment while the tracker is failing means the
+    # score is missing because the LLM is down, not because it did not apply.
+    # Only that case gets a banner (RISK_OFF never calls the LLM at all).
+    llm_unavailable_note = ""
+    if (
+        signal.tier == Tier.EMERGENCY
+        and effective_assessment is None
+        and LLM_HEALTH.degraded
+    ):
+        llm_unavailable_note = LLM_HEALTH.banner_text()
 
     # ── 3) HTML body. ─────────────────────────────────────────────────
     html = _build_html(
@@ -325,6 +341,7 @@ def render_email(
         plot_cid_6h=plot_cid(EMAIL_STACK_WINDOWS[1]),
         replay_event_id=replay_result.event.event_id,
         llm_assessment=effective_assessment,
+        llm_unavailable_note=llm_unavailable_note,
     )
 
     return RenderedEmail(
@@ -350,6 +367,7 @@ def _build_html(
     plot_cid_6h: str,
     replay_event_id: str,
     llm_assessment: AlertAssessment | None = None,
+    llm_unavailable_note: str = "",
 ) -> str:
     """HTML body using inline CSS only, safe for Gmail."""
     bar_color = _TIER_COLOR[signal.tier]
@@ -457,36 +475,64 @@ border-bottom:1px solid #f0f0f0;">{escape(footnote_body)}</td>
     )
 
     # ── P11(b).4 + P12-C: add the LLM analysis row only for EMERGENCY.
-    # Show only Insider-trading suspicion (3 to 5 bullets).
+    # Show the Market-impact score (3 to 5 bullets). When score>=8, append an
+    # "insider-pattern suspicion" tag in red next to the score (2026-06-16).
     # NOTE (changed 2026-05-14): previously this also showed a "Trader's view"
     # row, but it was removed across all channels (X / Email / Telegram) because
-    # the user decided the insider analysis is sufficient. The LLM still produces
+    # the user decided the one-line summary is sufficient. The LLM still produces
     # market_bullets because the cost is negligible and optionality is useful, but
     # they are not rendered.
     if llm_assessment is not None:
-        if llm_assessment.score >= 7:
-            assess_color = "#d32f2f"   # red — strong insider similarity
-        elif llm_assessment.score >= 4:
-            assess_color = "#f57c00"   # orange — partial
+        if llm_assessment.score >= INSIDER_PATTERN_TAG_THRESHOLD:
+            assess_color = "#d32f2f"   # red — high impact (insider-pattern)
+        elif llm_assessment.score >= 5:
+            assess_color = "#f57c00"   # orange — moderate impact (X-posting band)
         else:
-            assess_color = "#666666"   # gray — weak / unrelated
+            assess_color = "#666666"   # gray — minor / unrelated
 
-        insider_bullets_html = "<br>".join(
-            f"- {escape(b)}" for b in llm_assessment.insider_bullets
+        impact_bullets_html = "<br>".join(
+            f"- {escape(b)}" for b in llm_assessment.impact_bullets
         )
+        # score>=8 → insider-pattern tag (red, same line).
+        # Excluded channels (truth_social) never get it.
+        if (
+            llm_assessment.score >= INSIDER_PATTERN_TAG_THRESHOLD
+            and shows_insider_pattern_tag(signal.channel)
+        ):
+            tag_html = (
+                f' <span style="color:#d32f2f; font-weight:bold;">'
+                f"\u26a0\ufe0f {escape(INSIDER_PATTERN_TAG_LABEL)}</span>"
+            )
+        else:
+            tag_html = ""
         assess_row_html = f"""
         <tr>
           <td style="padding:7px 8px; color:#777; \
 vertical-align:top;">\
-Insider-trading suspicion</td>
+Market-impact</td>
           <td style="padding:7px 8px; line-height:1.5;">
             <span style="color:{assess_color}; font-weight:bold;">\
-{llm_assessment.score}/10</span><br>
-            {insider_bullets_html}
+{llm_assessment.score}/10</span>{tag_html}<br>
+            {impact_bullets_html}
           </td>
         </tr>"""
     else:
         assess_row_html = ""
+
+    # When the LLM keeps failing, say so at the top of the body so the reader
+    # knows why Market-impact is missing (user decision 2026-08-09). Without
+    # this the row just vanishes — which went unnoticed for 7.5 days.
+    if llm_unavailable_note:
+        llm_warning_html = f"""
+    <tr><td style="padding:12px 22px 0 22px;">
+      <div style="background:#fff4e5; border-left:4px solid #f57c00; \
+padding:10px 14px; font-size:13px; color:#7a4a00; line-height:1.5;">
+        <strong>\u26a0\ufe0f LLM scoring unavailable</strong><br>
+        {escape(llm_unavailable_note)}
+      </div>
+    </td></tr>"""
+    else:
+        llm_warning_html = ""
 
     return f"""<!DOCTYPE html>
 <html><body style="font-family:Arial,Helvetica,sans-serif; \
@@ -501,7 +547,7 @@ font-size:18px; font-weight:bold; line-height:1.3;">
         <span style="vertical-align:middle;">{escape(title_text)}</span>
       </td>
     </tr>
-
+{llm_warning_html}
     <tr><td style="padding:18px 22px;">
       <h3 style="margin:0 0 12px 0; font-size:14px; color:#333;">Alert metadata</h3>
       <table cellpadding="0" cellspacing="0" border="0" \
@@ -580,30 +626,36 @@ style="{plot_img_style}">
 def _assessment_from_truth_social_codes(
     reason_codes: list[str],
 ) -> AlertAssessment | None:
-    """Extract INSIDER_SUSPICION / INSIDER_NOTE / ANALYSIS from truth_social
+    """Extract IMPACT_SCORE / INSIDER_NOTE / ANALYSIS from truth_social
     signal reason_codes and convert them into an AlertAssessment object.
 
     The LLM already performed its own assessment in truth_social/llm_scorer.py,
     so the dispatcher does not need to call another LLMAlertAssessor. Wrap the
-    data in AlertAssessment only to reuse the same row format.
+    data in AlertAssessment only to reuse the same "Market-impact" row format.
+
+    Naming change (2026-06-16): now that the row is labeled "Market-impact",
+    the displayed score uses truth_social's market-impact score (IMPACT_SCORE)
+    instead of insider_concern_score (INSIDER_SUSPICION), which no longer
+    matches the new label. The renderer adds the insider-pattern tag when
+    score >= 8.
 
     Args:
         reason_codes: ChannelSignal.reason_codes, filled by the LLM scorer.
 
     Returns:
-        AlertAssessment with score=insider_concern_score. Return None when there
-        is no INSIDER_SUSPICION code.
+        AlertAssessment with score=market_impact_score. Return None when there
+        is no IMPACT_SCORE code.
     """
-    suspicion_score: int | None = None
+    impact_score: int | None = None
     insider_note = ""
     analysis = ""
 
     for code in reason_codes:
-        if code.startswith("INSIDER_SUSPICION="):
-            # Example: "INSIDER_SUSPICION=8/10" → 8.
+        if code.startswith("IMPACT_SCORE="):
+            # Example: "IMPACT_SCORE=8/10" → 8.
             raw = code.split("=", 1)[1]
             try:
-                suspicion_score = int(raw.split("/", 1)[0])
+                impact_score = int(raw.split("/", 1)[0])
             except ValueError:
                 pass
         elif code.startswith("INSIDER_NOTE="):
@@ -611,24 +663,24 @@ def _assessment_from_truth_social_codes(
         elif code.startswith("ANALYSIS="):
             analysis = code.split("=", 1)[1]
 
-    if suspicion_score is None:
+    if impact_score is None:
         return None
 
-    # insider_bullets must contain at least one item for the row to render.
+    # impact_bullets must contain at least one item for the row to render.
     bullets: list[str] = []
-    if insider_note:
-        bullets.append(insider_note)
-    elif analysis:
+    if analysis:
         bullets.append(analysis)
+    elif insider_note:
+        bullets.append(insider_note)
     else:
         bullets.append(
-            f"LLM scored this Trump post {suspicion_score}/10 on insider concern."
+            f"LLM scored this Trump post {impact_score}/10 on market impact."
         )
     # market_bullets are unused for truth_social, but fill three values for dataclass compatibility.
     return AlertAssessment(
-        score=suspicion_score,
+        score=impact_score,
         verdict=analysis or insider_note or "(see Analysis row)",
-        insider_bullets=tuple(bullets),
+        impact_bullets=tuple(bullets),
         market_bullets=("", "", ""),
     )
 

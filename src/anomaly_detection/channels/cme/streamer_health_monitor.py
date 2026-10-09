@@ -22,7 +22,19 @@ Responsibilities (P9.3.P3 Step D):
     · HEARTBEAT_MALFORMED: ts parse failure (bucket write permission issue, corruption)
     · GCS_ERROR          : list/get itself failed (IAM, network)
 
+  False-positive guard (added 2026-06-16):
+    · gcs_error means "the monitor could not read GCS" (NOT "the streamer is
+      down") — semantically different from missing/stale. Transient SSL/network
+      blips are common and self-heal, so we do NOT page on a single failure;
+      a DOWN alert is sent only after N (GCS_ERROR_ALERT_AFTER) consecutive
+      failures. missing/stale are real outage signals and still alert immediately.
+
   On recovery, send a "✅ recovered" alert once for end-to-end visibility.
+    · The currently_down flag is in-memory, so it is lost when the Cloud Run
+      instance restarts → in the past a DOWN could arrive with no RECOVERED.
+      To prevent that, the down/ok state is persisted to GCS (STATE_BLOB) and
+      restored on boot, so the first healthy check after a restart still emits
+      the recovery alert once.
 ────────────────────────────────────────────────────────────────────────
 """
 
@@ -47,6 +59,14 @@ STALE_THRESHOLD_SEC: int = 360    # treat ≥ 6 minutes as outage
 ALERT_THROTTLE_SEC: int = 3600    # suppress duplicate alerts for 1 hour
 WARMUP_SEC: int = 60              # wait this long after boot before the first check
 
+# Alert on gcs_error only after N consecutive failures (guards against single
+# transient SSL/network blips). 5-min interval × 3 ≈ 15 min of GCS unreachability.
+GCS_ERROR_ALERT_AFTER: int = 3
+
+# GCS blob that persists the monitor's down/ok state — prevents a missed
+# recovery alert when the Cloud Run instance restarts.
+STATE_BLOB: str = "_health/monitor_state.json"
+
 
 @dataclass(frozen=True)
 class HealthMonitorConfig:
@@ -61,6 +81,7 @@ class HealthMonitorConfig:
     check_interval_sec: int = CHECK_INTERVAL_SEC
     stale_threshold_sec: int = STALE_THRESHOLD_SEC
     alert_throttle_sec: int = ALERT_THROTTLE_SEC
+    gcs_error_alert_after: int = GCS_ERROR_ALERT_AFTER
 
 
 @dataclass
@@ -69,6 +90,8 @@ class _AlertState:
     last_alert_ts: Optional[datetime] = None
     last_reason: Optional[str] = None   # "missing" / "stale" / "malformed" / "gcs_error"
     currently_down: bool = False        # True → awaiting a recovery alert
+    consecutive_gcs_errors: int = 0     # consecutive gcs_error counter (reset on read success)
+    down_state_persisted: bool = False  # whether the current down state was saved to GCS
 
 
 # =====================================================================
@@ -109,6 +132,9 @@ class StreamerHealthMonitor:
         """Forever loop — periodic checks + alerts until stop()."""
         try:
             await asyncio.sleep(WARMUP_SEC)  # give the streamer time to boot
+            # Restart guard — restore whether the previous instance ended "down"
+            # from GCS (if so, the next healthy check emits one ✅ recovered alert).
+            await self._load_persisted_state()
             while not self._stop_event.is_set():
                 try:
                     await self._check_once()
@@ -139,15 +165,29 @@ class StreamerHealthMonitor:
         try:
             payload = await asyncio.to_thread(self._fetch_heartbeat)
         except Exception as e:
+            # gcs_error = "the monitor could not read GCS" (NOT a streamer outage).
+            # Transient SSL/network blips do not page on a single failure — only
+            # after N consecutive failures.
+            self._state.consecutive_gcs_errors += 1
+            n = self._state.consecutive_gcs_errors
+            threshold = self._cfg.gcs_error_alert_after
             logger.warning(
-                "StreamerHealthMonitor: GCS access failed: %s (%s)",
-                e, type(e).__name__,
+                "StreamerHealthMonitor: GCS access failed (%d/%d): %s (%s)",
+                n, threshold, e, type(e).__name__,
             )
+            if n < threshold:
+                return  # below threshold — retry next cycle (false-positive guard)
             await self._report_problem(
                 reason="gcs_error",
-                detail=f"GCS access failed: {type(e).__name__}: {e}",
+                detail=(
+                    f"GCS access failed {n} times in a row "
+                    f"(threshold={threshold}): {type(e).__name__}: {e}"
+                ),
             )
             return
+
+        # Reached here = GCS read succeeded → reset the gcs_error counter.
+        self._state.consecutive_gcs_errors = 0
 
         if payload is None:
             await self._report_problem(
@@ -213,6 +253,75 @@ class StreamerHealthMonitor:
         return self._gcs_client
 
     # ─────────────────────────────────────────────────────────────────
+    # State persistence (GCS) — prevents a missed recovery alert on restart
+    # ─────────────────────────────────────────────────────────────────
+    async def _persist_state(self, *, down: bool, reason: Optional[str]) -> bool:
+        """Best-effort save of the current down/ok state to GCS. Returns success.
+
+        If GCS is unreachable the write may also fail → the exception is swallowed
+        and False is returned. The caller retries on the next tick (while down).
+        """
+        try:
+            await asyncio.to_thread(self._write_state_blob, down, reason)
+            return True
+        except Exception as e:
+            logger.warning(
+                "StreamerHealthMonitor: state persist failed: %s (%s)",
+                e, type(e).__name__,
+            )
+            return False
+
+    def _write_state_blob(self, down: bool, reason: Optional[str]) -> None:
+        """Sync helper — overwrite monitor_state.json in GCS."""
+        client = self._get_client()
+        bucket = client.bucket(self._cfg.gcs_bucket)
+        blob = bucket.blob(STATE_BLOB)
+        payload = {
+            "down": down,
+            "reason": reason,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        blob.upload_from_string(
+            json.dumps(payload, indent=2),
+            content_type="application/json",
+        )
+
+    async def _load_persisted_state(self) -> None:
+        """On boot, restore the previous monitor state — guarantees recovery
+        across restarts.
+
+        If the previous instance ended "down", restore currently_down=True so the
+        next healthy check emits one ✅ recovered alert.
+        """
+        try:
+            state = await asyncio.to_thread(self._read_state_blob)
+        except Exception as e:
+            logger.warning(
+                "StreamerHealthMonitor: state load failed: %s (%s)",
+                e, type(e).__name__,
+            )
+            return
+        if state and state.get("down") is True:
+            self._state.currently_down = True
+            self._state.last_reason = state.get("reason")
+            self._state.down_state_persisted = True
+            self._last_reason = state.get("reason")
+            logger.info(
+                "StreamerHealthMonitor: restored DOWN state from GCS "
+                "(reason=%s) — will emit recovered on next healthy check.",
+                state.get("reason"),
+            )
+
+    def _read_state_blob(self) -> Optional[dict]:
+        """Sync helper — read monitor_state.json (None if absent)."""
+        client = self._get_client()
+        bucket = client.bucket(self._cfg.gcs_bucket)
+        blob = bucket.blob(STATE_BLOB)
+        if not blob.exists(client):
+            return None
+        return json.loads(blob.download_as_bytes())
+
+    # ─────────────────────────────────────────────────────────────────
     # Alert emit — throttle + recovery
     # ─────────────────────────────────────────────────────────────────
     async def _report_problem(
@@ -238,6 +347,13 @@ class StreamerHealthMonitor:
                 reason, (now - self._state.last_alert_ts).total_seconds(),
             )
             self._state.currently_down = True
+            # If the down state was not yet persisted (e.g. the GCS write also
+            # failed on the first alert), retry every tick — once GCS is briefly
+            # writable the state sticks, guaranteeing recovery across restarts.
+            if not self._state.down_state_persisted:
+                self._state.down_state_persisted = await self._persist_state(
+                    down=True, reason=reason,
+                )
             return
 
         subject = f"⚠️ [CME Streamer DOWN] {reason.upper()}"
@@ -252,6 +368,10 @@ class StreamerHealthMonitor:
         self._state.last_alert_ts = now
         self._state.last_reason = reason
         self._state.currently_down = True
+        # Persist the down state to GCS (best-effort) so a restart still recovers.
+        self._state.down_state_persisted = await self._persist_state(
+            down=True, reason=reason,
+        )
         logger.error(
             "StreamerHealthMonitor: DOWN alert sent (reason=%s): %s",
             reason, detail,
@@ -277,6 +397,9 @@ class StreamerHealthMonitor:
         await self._dispatch(subject=subject, html=html, text=text)
         self._state.currently_down = False
         self._state.last_reason = None
+        self._state.down_state_persisted = False
+        # Persist the recovered state so a later restart does not re-read a stale down.
+        await self._persist_state(down=False, reason=None)
         logger.info("StreamerHealthMonitor: recovered — alert sent (age=%.0fs)", age_sec)
 
     async def _dispatch(
@@ -306,6 +429,8 @@ class StreamerHealthMonitor:
                 self._last_heartbeat_ts.isoformat() if self._last_heartbeat_ts else None
             ),
             "currently_down": self._state.currently_down,
+            "consecutive_gcs_errors": self._state.consecutive_gcs_errors,
+            "down_state_persisted": self._state.down_state_persisted,
             "last_reason": self._last_reason,
             "last_alert_ts": (
                 self._state.last_alert_ts.isoformat()
@@ -412,4 +537,6 @@ __all__ = [
     "CHECK_INTERVAL_SEC",
     "STALE_THRESHOLD_SEC",
     "ALERT_THROTTLE_SEC",
+    "GCS_ERROR_ALERT_AFTER",
+    "STATE_BLOB",
 ]

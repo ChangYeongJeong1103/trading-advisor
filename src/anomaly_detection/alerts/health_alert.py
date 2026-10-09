@@ -49,9 +49,10 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .renderer.channel_email import RenderedEmail
+if TYPE_CHECKING:  # Avoid a circular import; see render_health_email below.
+    from .renderer.channel_email import RenderedEmail
 
 logger = logging.getLogger(__name__)
 
@@ -162,12 +163,16 @@ _KIND_TO_LABEL: dict[HealthAlertKind, str] = {
 }
 
 
-def render_health_email(alert: SystemHealthAlert) -> RenderedEmail:
+def render_health_email(alert: SystemHealthAlert) -> "RenderedEmail":
     """SystemHealthAlert → 단순 HTML email (PNG 첨부 없음).
 
     Subject 는 시장 alert 와 구분되도록 "[Health]" prefix 를 박는다 — 사용자가
     inbox 에서 한 눈에 분리 가능. 본문은 plain HTML (style minimal).
     """
+    # Deferred import: channel_email reaches back here through llm_assessor,
+    # so importing it at module level would be circular.
+    from .renderer.channel_email import RenderedEmail
+
     emoji = _KIND_TO_EMOJI[alert.kind]
     label = _KIND_TO_LABEL[alert.kind]
     subject = f"{emoji} [Health] {label} — {alert.component}"

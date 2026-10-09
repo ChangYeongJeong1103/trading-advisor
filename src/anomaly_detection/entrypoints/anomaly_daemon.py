@@ -30,6 +30,7 @@ Env vars (injected via Cloud Run env / Secret Manager):
   PORT               = HTTP server port      (auto-injected by Cloud Run, default 8080)
   ANOMALY_DATA_PATH  = data/ override        (on Cloud Run: /tmp/anomaly-data or GCS FUSE mount)
   ANOMALY_DRY_RUN    = "true" / "false"      (force dry-run; if unset, auto — dry when no secrets)
+  ENABLE_TELEGRAM    = "true" / "false"      (toggle Telegram sending on/off; default false)
   + all of SecretsConfig: SMTP_*, TELEGRAM_*, *_API_KEY (see config/config.py)
 """
 
@@ -53,6 +54,8 @@ from ..alerts.channel_dispatcher import ChannelAlertDispatcher
 from ..alerts.cooldown import ChannelAlertCooldown
 from ..alerts.live_timeline import LiveTimelineBuffer
 from ..alerts.llm_assessor import LLMAlertAssessor
+from ..alerts.llm_health import LLM_HEALTH
+from ..alerts.x_api_health import X_API_HEALTH
 from ..alerts.renderer.channel_email import SmtpConfig as ChannelSmtpConfig
 from ..alerts.renderer.email import EmailConfig, EmailRenderer
 from ..alerts.renderer.telegram import TelegramConfig, TelegramRenderer
@@ -333,6 +336,16 @@ class AnomalyDaemon:
             dry_run=tg_dry,
         )
 
+        # Telegram channel on/off toggle (user decision 2026-06-16):
+        #   In practice Telegram is rarely read, so default OFF (email + X posting
+        #   are sufficient). Set ENABLE_TELEGRAM=true to re-enable (no code change).
+        #   When OFF, the dispatcher receives telegram_config=None, disabling the
+        #   entire telegram path.
+        telegram_enabled_env = self._parse_bool(os.getenv("ENABLE_TELEGRAM"))
+        self.telegram_enabled = (
+            bool(telegram_enabled_env) if telegram_enabled_env is not None else False
+        )
+
         # P11(b).4 (lock 2026-04-23): add LLM similarity assessment to
         # EMERGENCY alerts. If OPENAI_API_KEY is missing, assessor.enabled=False
         # auto-disables → email still sends, just without the "LLM Assess" row.
@@ -363,9 +376,10 @@ class AnomalyDaemon:
         x_post_enabled = bool(x_post_enabled_env) if x_post_enabled_env is not None else False
         x_post_dry_env = self._parse_bool(os.getenv("X_POST_DRY_RUN"))
         x_post_dry = bool(x_post_dry_env) if x_post_dry_env is not None else True
-        # X_POST_MIN_SCORE: 0-10. Even after passing the EMERGENCY gate, X
-        # posting is skipped when the LLM insider-trading suspicion score
-        # is below this value. Default = 7. Invalid values fall back to 7.
+        # X_POST_MIN_SCORE: 0-10. Market-impact score gate applied only to
+        # score_gated_channels (= polymarket). Default = 7 (per-channel gate
+        # introduced 2026-06-16). Other channels (hyperliquid/cme/x/truth_social)
+        # post on EMERGENCY regardless of score. Invalid values fall back to 7.
         try:
             x_post_min_score = int(os.getenv("X_POST_MIN_SCORE", "7"))
         except ValueError:
@@ -415,7 +429,10 @@ class AnomalyDaemon:
             buffer=self.timeline_buffer,
             smtp_config=self.channel_smtp_config,
             out_root=alerts_live_dir,
-            telegram_config=self.channel_telegram_config,
+            # ENABLE_TELEGRAM=false (default) → None → telegram path disabled.
+            telegram_config=(
+                self.channel_telegram_config if self.telegram_enabled else None
+            ),
             telegram_emergency_only=True,  # P11(d) lock
             # P11(b).2 lock (2026-04-22): restore D11 design — do NOT send WATCH
             # emails immediately. WATCH is only tracked via GCS audit + weekly_review.sh.
@@ -436,6 +453,15 @@ class AnomalyDaemon:
             ohlc_buffer=self.alert_ohlc_buffer,
         )
 
+        # LLM outage detection (user decision 2026-08-09).
+        # On 2026-08-02 the OpenAI credit ran out and every LLM call failed
+        # with 429 for 7.5 days, but each call site fell back quietly so it
+        # went unnoticed. Sustained failures now trigger an ops email.
+        # (Health-alert path, so it never reaches Telegram or X.)
+        LLM_HEALTH.set_alert_cb(self.channel_dispatcher.dispatch_health_alert)
+        # X API (collection + EMERGENCY posting) uses the same email-only health path.
+        X_API_HEALTH.set_alert_cb(self.channel_dispatcher.dispatch_health_alert)
+
         self.orchestrator = AnomalyOrchestrator(
             registry=self.registry,
             signal_store=self.signal_store,
@@ -453,6 +479,7 @@ class AnomalyDaemon:
         self._started_at: datetime | None = None
         self._alert_modes = {
             "email_dry_run": email_dry,
+            "telegram_enabled": self.telegram_enabled,
             "telegram_dry_run": tg_dry,
             "x_post_enabled": self.x_post_config.enabled,
             "x_post_dry_run": self.x_post_config.dry_run,
@@ -692,10 +719,9 @@ class AnomalyDaemon:
 
         # 5) P12-F Health digest — one summary email of every registered
         #    component. Disable with HEALTH_ALERTS_ENABLED=false.
-        #    User decision 2026-05-30: while the codebase is still being
-        #    iterated heavily, run daily=True so the digest fires every
-        #    day at 06:00 PT. Switch back to daily=False for weekly
-        #    cadence (Mon 06:00 PT) once things stabilize.
+        #    User decision 2026-07-26: the system has stabilized, so switch
+        #    back to daily=False — weekly cadence (Mon 06:00 PT). It ran
+        #    daily from 2026-05-30 while the codebase was iterated heavily.
         if os.environ.get("HEALTH_ALERTS_ENABLED", "true").lower() != "false":
             self._tasks.append(asyncio.create_task(
                 weekly_digest_loop(
@@ -705,11 +731,11 @@ class AnomalyDaemon:
                     timezone_name=os.environ.get(
                         "WEEKLY_HEALTH_DIGEST_TZ", "America/Los_Angeles",
                     ),
-                    daily=True,
+                    daily=False,
                 ),
                 name="health-digest",
             ))
-            logger.info("health_digest_enabled", cadence="daily")
+            logger.info("health_digest_enabled", cadence="weekly")
         else:
             logger.info("health_digest_disabled")
 

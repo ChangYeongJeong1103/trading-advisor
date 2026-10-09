@@ -70,6 +70,9 @@ from typing import Any
 
 import httpx
 
+# Consecutive X API failures → ops email (e.g. credits depleted). Added 2026-10-09.
+from ...alerts.x_api_health import X_API_HEALTH
+
 logger = logging.getLogger(__name__)
 
 
@@ -249,13 +252,15 @@ class XCollector:
         try:
             r = await self._http_client.get(url, headers=headers, params=params)
         except httpx.HTTPError as e:
+            await X_API_HEALTH.record_failure(source="x_collector", error=e)
             raise RuntimeError(f"X API tweets request failed: {e}") from e
 
         if r.status_code != 200:
-            raise RuntimeError(
-                f"X API tweets returned {r.status_code}: {r.text[:200]}"
-            )
+            error_text = f"X API tweets returned {r.status_code}: {r.text[:200]}"
+            await X_API_HEALTH.record_failure(source="x_collector", error=error_text)
+            raise RuntimeError(error_text)
 
+        await X_API_HEALTH.record_success(source="x_collector")
         data = r.json()
         tweets = data.get("data", []) or []
         media_lookup = self._build_media_lookup(data.get("includes", {}))
@@ -309,6 +314,7 @@ class XCollector:
             r = await self._http_client.get(url, headers=headers)
         except httpx.HTTPError as e:
             logger.warning("XCollector: X API user lookup HTTP error %s: %s", username, e)
+            await X_API_HEALTH.record_failure(source="x_collector", error=e)
             return None
 
         if r.status_code != 200:
@@ -316,7 +322,13 @@ class XCollector:
                 "XCollector: X API user lookup failed %s: %d %s",
                 username, r.status_code, r.text[:200],
             )
+            await X_API_HEALTH.record_failure(
+                source="x_collector",
+                error=f"X API user lookup returned {r.status_code}: {r.text[:200]}",
+            )
             return None
+
+        await X_API_HEALTH.record_success(source="x_collector")
 
         data = r.json().get("data", {})
         user_id = data.get("id")

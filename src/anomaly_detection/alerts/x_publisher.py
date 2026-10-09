@@ -50,12 +50,18 @@ class XPostConfig:
     enabled: bool = False
     dry_run: bool = True
     timeout_s: float = 20.0
-    # Minimum LLM suspicion score (0-10) required for X auto-posting.
-    # Even after passing the EMERGENCY tier gate, if the LLM
-    # insider-trading suspicion score is below this threshold, the
-    # post is skipped. Introduced to reduce X feed noise (default = 7).
-    # If llm_assessment is None (score unknown), we conservatively skip.
+    # Market-impact score gate threshold (0-10) — applied ONLY to channels in
+    # `score_gated_channels`. For those channels, even after passing the
+    # EMERGENCY tier gate, the post is skipped when the market-impact score is
+    # below this value (or llm_assessment is None).
+    #
+    # User decision 2026-06-16 — per-channel gate:
+    #   · polymarket            → EMERGENCY + score >= min_score (7)
+    #   · hyperliquid/cme/x/truth_social → post on EMERGENCY regardless of score
     min_score: int = 7
+    # Channels that require the score gate. Channels not listed here post on
+    # EMERGENCY alone (score-agnostic, fine even when llm_assessment is None).
+    score_gated_channels: frozenset[str] = frozenset({"polymarket"})
 
 
 @dataclass(frozen=True)

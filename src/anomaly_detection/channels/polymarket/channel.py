@@ -361,24 +361,28 @@ class PolymarketChannel(Channel):
         if needs_market_fetch:
             market = await self._collector.fetch_market(slug)
             if market is None:
+                # P12-C: presumed closed/resolved slug → increment strike counter.
+                # After _MISSING_MARKET_SKIP_AFTER consecutive strikes, _poll_loop auto-skips.
+                # Slugs with an already-cached conditionId are counted too, so a market
+                # that closes mid-run is not polled forever (Gamma returns an empty
+                # list for closed markets; network errors raise and never reach here).
+                strikes = self._missing_market_strikes.get(slug, 0) + 1
+                self._missing_market_strikes[slug] = strikes
+                if strikes == _MISSING_MARKET_SKIP_AFTER:
+                    logger.warning(
+                        "PolymarketChannel: slug=%s consistently missing (%d strikes) "
+                        "→ removing from rotation. Recommend cleaning up watchlist.yaml.",
+                        slug, strikes,
+                    )
+                else:
+                    logger.debug(
+                        "PolymarketChannel: slug=%s not found (strike %d/%d)",
+                        slug, strikes, _MISSING_MARKET_SKIP_AFTER,
+                    )
                 # First fetch failure → return if no conditionId (cannot fetch trades).
-                # If we have a cached one (refresh failure), reuse the existing cache.
-                if condition_id is None:
-                    # P12-C: presumed closed/resolved slug → increment strike counter.
-                    # After _MISSING_MARKET_SKIP_AFTER consecutive strikes, _poll_loop auto-skips.
-                    strikes = self._missing_market_strikes.get(slug, 0) + 1
-                    self._missing_market_strikes[slug] = strikes
-                    if strikes == _MISSING_MARKET_SKIP_AFTER:
-                        logger.warning(
-                            "PolymarketChannel: slug=%s consistently missing (%d strikes) "
-                            "→ removing from rotation. Recommend cleaning up watchlist.yaml.",
-                            slug, strikes,
-                        )
-                    else:
-                        logger.debug(
-                            "PolymarketChannel: slug=%s not found (strike %d/%d)",
-                            slug, strikes, _MISSING_MARKET_SKIP_AFTER,
-                        )
+                # Also return once the slug has been judged expired.
+                # Otherwise (transient refresh failure), reuse the existing cache.
+                if condition_id is None or strikes >= _MISSING_MARKET_SKIP_AFTER:
                     return
             else:
                 # Extract conditionId (only meaningful on first run — stable after)

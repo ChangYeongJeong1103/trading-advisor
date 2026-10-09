@@ -75,6 +75,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ...alerts.llm_health import LLM_HEALTH
 from ...core.schemas import (
     CHANNEL_X,
     ChannelSignal,
@@ -270,7 +271,11 @@ class LLMClassifier:
                 "LLMClassifier: failed for post_id=%s user=%s: %s",
                 post_id, post.get("user"), e,
             )
+            # Record on the shared tracker so a sustained outage emails ops.
+            await LLM_HEALTH.record_failure(source="x_classifier", error=e)
             classification = self._safe_fallback(reason=f"llm_error:{type(e).__name__}")
+        else:
+            await LLM_HEALTH.record_success(source="x_classifier")
 
         # ── Save to cache ────────────────────────────────────────
         if post_id and self._cache_ttl_s > 0:

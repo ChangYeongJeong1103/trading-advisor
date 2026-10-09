@@ -13,33 +13,16 @@
 # (the <slug> in polymarket.com/market/<slug>)
 # ─────────────────────────────────────────────────────────────────────
 polymarket_markets:
-  # ── geopolitical / Iran — short-term (May expiry, very active) ──
-  # P12-C refresh (2026-05-14): the four April-expiry markets expired and
-  # were replaced with the May 31 short-term set below.
-  - "us-x-iran-permanent-peace-deal-by-may-31-2026-333-871-241-192"  # $632k/24h, short peace-deal bet
-  - "strait-of-hormuz-traffic-returns-to-normal-by-end-of-may"        # $574k/24h, direct oil exposure
-  - "us-obtains-iranian-enriched-uranium-by-may-31-396"               # $574k/24h, uranium-handoff scenario
+  # ── geopolitical / Iran · oil — short-term (October 31 expiry) ──
+  - "strait-of-hormuz-traffic-returns-to-normal-by-october-31-20260810151043583" # ~$165k/24h, direct oil exposure
+  - "us-x-iran-ceasefire-continues-through-october-31-20260917"                  # ~$79k/24h, U.S.–Iran ceasefire durability
+  - "us-announces-end-of-iranian-blockade-by-october-31-2026-20260727171711632-895-372-622-413-171-454-592-696" # ~$177k/24h, end of U.S. blockade
 
-  # ── geopolitical / Iran — mid-term (June expiry, signal continues after May markets close) ──
-  - "strait-of-hormuz-traffic-returns-to-normal-by-end-of-june"       # $365k/24h, Hormuz June backup
-  - "will-the-iranian-regime-fall-by-june-30"                         # existing — regime change, June expiry
-  - "us-x-iran-permanent-peace-deal-by-june-30-2026-837-641-896-877"  # $215k/24h, peace deal June expiry
+  # ── geopolitical / Iran — long-term baseline ──
+  - "will-the-us-invade-iran-before-2027"                       # ~$197k/24h, long-term military-escalation gauge
 
-  # ── geopolitical / Iran — long-term (Dec expiry, baseline) ──
-  - "will-the-us-invade-iran-before-2027"          # existing — most active Iran market on Polymarket
-  - "us-iran-nuclear-deal-before-2027"             # existing — diplomatic surprise (Dec expiry)
-
-  # ── macro / Fed — June FOMC (2026-06-17 expiry, both hawkish/dovish tails) ──
-  # Watch both tails — if one side's odds suddenly jump, that hints at insider flow.
-  - "will-the-fed-decrease-interest-rates-by-25-bps-after-the-june-2026-meeting"  # $274k/24h, dovish surprise
-  - "will-the-fed-increase-interest-rates-by-25-bps-after-the-june-2026-meeting"  # $520k/24h, hawkish surprise
-
-  # ── macro / Fed — cumulative cuts by year-end (long-term) ──
-  - "will-7-fed-rate-cuts-happen-in-2026"          # $204k/24h, Dec expiry backup
-
-  # ── geopolitical / Russia–Ukraine (added in P12-C) ──
-  # Covers ceasefire / regime / NATO escalation.
-  - "russia-x-ukraine-ceasefire-agreement-by-june-30-2026"  # $61k/24h, ceasefire negotiation signal
+  # ── macro / Fed — October FOMC (Oct 28 meeting) ──
+  - "will-the-fed-increase-interest-rates-by-25-bps-after-the-october-2026-meeting-20260617190324032" # ~$211k/24h
 
   # NOTE: expired slugs are silently skipped by the daemon (logging.debug).
   #       Edit this watchlist freely → restart the daemon to apply

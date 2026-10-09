@@ -39,12 +39,12 @@ Design decisions (mirroring the X channel's LLMClassifier pattern):
      The LLM is called only once even if the same post_id arrives twice.
 
 ────────────────────────────────────────────────────────────────────────
-Score → Tier mapping (user decision):
+Score → Tier mapping (user decision, threshold updated 2026-06-16):
 
-  · 9-10 → Tier.EMERGENCY  (Email + Telegram + X)
-  · 7-8  → Tier.RISK_OFF   (Email only)
-  · 5-6  → Tier.WATCH      (emit signal, no alert — dispatcher email_min_tier=RISK_OFF)
-  · 0-4  → Tier.NORMAL     (no signal emit)
+  · 8-10 → Tier.EMERGENCY  (Email + Telegram + X)
+  · 6-7  → Tier.RISK_OFF   (Email only)
+  · 4-5  → Tier.WATCH      (emit signal, no alert — dispatcher email_min_tier=RISK_OFF)
+  · 0-3  → Tier.NORMAL     (no signal emit)
 
   ChannelSignal.score [0,1] = llm_score / 10.0.
 
@@ -73,6 +73,7 @@ from ...core.schemas import (
     Direction,
     Tier,
 )
+from ...alerts.llm_health import LLM_HEALTH
 from .normalize import TruthPost
 from .reference_db import RetrievedReference, TruthSocialReferenceDB
 
@@ -144,17 +145,21 @@ class MarketImpactScore(BaseModel):
         default="", max_length=400,
         description=(
             "1-2 sentences explaining the insider_concern_score reasoning. "
-            "Surfaced in the email body `Insider-trading suspicion` row."
+            "Surfaced as a fallback bullet in the email body `Market-impact` "
+            "row (ANALYSIS=rationale takes priority; this INSIDER_NOTE is used "
+            "only when rationale is absent)."
         ),
     )
 
     # ── Tier mapping helper ──
+    # Threshold change (user decision 2026-06-16): EMERGENCY floor lowered 9→8.
+    #   8-10 → EMERGENCY, 6-7 → RISK_OFF, 4-5 → WATCH, 0-3 → NORMAL
     def to_tier(self) -> Tier:
-        if self.score >= 9:
+        if self.score >= 8:
             return Tier.EMERGENCY
-        if self.score >= 7:
+        if self.score >= 6:
             return Tier.RISK_OFF
-        if self.score >= 5:
+        if self.score >= 4:
             return Tier.WATCH
         return Tier.NORMAL
 
@@ -371,6 +376,9 @@ class TruthSocialLLMScorer:
             references = []
 
         # ── LLM call ──
+        # Keep the fallback so one failure never stops the loop, but record it
+        # on the shared tracker. This channel derives its tier from the LLM
+        # score, so a silent fallback means the channel is blind.
         try:
             result = await self._call_llm(post, references)
         except (APIError, APITimeoutError, RateLimitError, asyncio.TimeoutError) as e:
@@ -378,13 +386,17 @@ class TruthSocialLLMScorer:
                 "TruthSocialLLMScorer: LLM API error post_id=%s: %s",
                 post.post_id, e,
             )
+            await LLM_HEALTH.record_failure(source="truth_social_scorer", error=e)
             result = self._fallback_score()
         except Exception as e:  # noqa: BLE001 — final safety net
             logger.exception(
                 "TruthSocialLLMScorer: unexpected error post_id=%s: %s",
                 post.post_id, e,
             )
+            await LLM_HEALTH.record_failure(source="truth_social_scorer", error=e)
             result = self._fallback_score()
+        else:
+            await LLM_HEALTH.record_success(source="truth_social_scorer")
 
         # ── cache + return ──
         self._cache[post.post_id] = (time.time(), result)

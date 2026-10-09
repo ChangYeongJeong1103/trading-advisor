@@ -1,36 +1,47 @@
 """
-alerts/llm_assessor.py — Add LLM similarity assessment to EMERGENCY alerts.
+alerts/llm_assessor.py — Add LLM market-impact assessment to EMERGENCY alerts.
 
 ────────────────────────────────────────────────────────────────────────
-Role (P11(b).4, user decision locked 2026-04-23):
+Role (P11(b).4 locked 2026-04-23, rubric redefined 2026-06-16):
 
   At the moment EMERGENCY fires, send the relevant
   (channel, symbol, detectors, reason_codes, score, direction) to an LLM
-  (GPT-5.4-mini) and ask:
-  "How similar is this alert to the 6 insider-trading events recorded in
-  `data/anomaly/historical_events/*.md`?", on a 0~10 scale.
+  (GPT-5.4) and ask:
+  "How market-moving is this flow likely to be (for stocks)?" — a
+  **market-impact score** on a 0~10 scale.
 
-    10/10 = exact same pattern as a past insider event (same channel /
-            same detector signature / same direction / pre-event timing)
-     0/10 = entirely different smart-money activity (unrelated to the
-            historical insider pattern)
+    10/10 = closely resembles a past high-impact pre-event flow — a large
+            market move is likely (concentrated, oversized, one-way, pre-event).
+     0/10 = noise, no market relevance.
 
-  The LLM also gives a short verbal reasoning. It's pinned at the last
-  row of the email body's metadata table as `LLM Assess | (x/10) {reasoning}`.
+  ── Naming change (2026-06-16, user decision) ─────────────────────────
+    · This score used to be called "insider-trading suspicion", but that's
+      too strong as an everyday label, so it was renamed to **Market-impact**
+      (avoids asserting illegality).
+    · However, the extreme band (score >= 8) — concentrated, one-way bets
+      placed before the event — is the textbook informed (insider) pattern,
+      so the renderer attaches a separate **"insider-pattern suspicion"** tag
+      at that level (renderer's INSIDER_PATTERN_TAG_THRESHOLD).
+    · The reference library below (_HISTORICAL_EVENTS_BRIEF) is the set of 6
+      past "high-impact pre-event flow precedents"; resemblance to them is
+      what defines the top of the market-impact scale (i.e. 8-10 = looks like
+      those precedents = insider-pattern).
+
+  The LLM also gives a short verbal reasoning + impact-justification bullets,
+  pinned in the "Market-impact: x/10" row of email/telegram/X.
 
 ────────────────────────────────────────────────────────────────────────
 Design decisions:
 
   1. EMERGENCY only. RISK_OFF / WATCH are skipped — saves LLM cost +
      adds an LLM opinion only at the moments the user really needs to focus.
-  2. Static prompt (prompt-cache friendly) — the 6 historical-event
-     signatures are embedded as a const in this module. No file I/O,
-     no environment dependency.
+  2. Static prompt (prompt-cache friendly) — the 6 precedent signatures
+     are embedded as a const in this module. No file I/O, no env dependency.
   3. Fail-safe — LLM failure / no API key / timeout all cause `assess()`
      to return None. The dispatcher simply omits the metadata row when None.
   4. JSON mode + pydantic validate — broken-schema responses become None.
-  5. Short output (≤ 280 chars reasoning) — enforced via the system prompt
-     so it fits in one email metadata row.
+  5. Short output — length enforced via the system prompt so it fits the
+     email/telegram row.
   6. Lazy client — AsyncOpenAI is created only on the first assess() call.
 
 ────────────────────────────────────────────────────────────────────────
@@ -54,6 +65,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..core.schemas import ChannelSignal, Tier
+from .llm_health import LLM_HEALTH
 
 try:
     from openai import AsyncOpenAI  # type: ignore[import-not-found]
@@ -68,7 +80,12 @@ logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Compact brief of 6 historical insider-trading events.
+# Compact brief of 6 historical HIGH-IMPACT pre-event flow precedents.
+#
+# These precedents all share the shape "concentrated, oversized, one-way
+# flow before an event → large market move right after" (previously curated
+# as insider-trading cases). The LLM uses resemblance to them to set the
+# top band (8-10) of the current alert's market-impact score.
 #
 # Each entry contains just enough information for the LLM to decide
 # "which of these does this alert most resemble?". The originals are in
@@ -77,7 +94,7 @@ logger = logging.getLogger(__name__)
 # Update trigger: when a new historical event is added, also update this constant.
 # =====================================================================
 _HISTORICAL_EVENTS_BRIEF: str = """
-6 historical insider trading events (user-curated summary):
+6 historical high-impact pre-event flow precedents (user-curated summary):
 
 [1] 2025-04-09 Liberation Day — Trump tariff 90d pause
   · primary channel: CME
@@ -138,7 +155,7 @@ _HISTORICAL_EVENTS_BRIEF: str = """
   · pattern: 1-minute burst insider (same pattern as [1] and [5]).
   · 3rd repetition → strongly suspected same actor, CFTC investigation.
 
-Common patterns (core insider signatures):
+Common patterns (core high-impact pre-event signatures):
   · pre-event timing: T-1min ~ T-6d (varies by symbol, but definitely
     before the public announcement).
   · one-way directional bet (no hedge), aggressive taker.
@@ -163,7 +180,10 @@ class _LLMAssessResponse(BaseModel):
 
     score: int = Field(
         ge=0, le=10,
-        description="Integer 0~10. 10 = identical to a past insider, 0 = completely different.",
+        description=(
+            "Integer 0~10 market-impact score. 10 = a large market move is "
+            "very likely (resembles a high-impact precedent), 0 = noise."
+        ),
     )
     verdict: str = Field(
         min_length=1, max_length=1500,
@@ -172,11 +192,12 @@ class _LLMAssessResponse(BaseModel):
             "Don't pad. (Hard cap 1500 chars.)"
         ),
     )
-    insider_bullets: list[str] = Field(
+    impact_bullets: list[str] = Field(
         default_factory=list,
         description=(
-            "3-5 bullets summarizing the insider-trading perspective. Each "
-            "bullet is one sentence focused on key evidence + caveats."
+            "3-5 bullets justifying the market-impact score. Each bullet is "
+            "one sentence on size/direction/cross-confirmation/timing/"
+            "precedent-resemblance + caveats."
         ),
     )
     market_bullets: list[str] = Field(
@@ -193,7 +214,9 @@ class AlertAssessment:
     """Result of assess() — passed straight to the email renderer.
 
     Attributes:
-        score: 0~10 integer (10 = same pattern as insider, 0 = completely different).
+        score: 0~10 integer market-impact score (10 = large move very likely,
+            0 = noise). At score >= 8 the renderer also attaches an
+            "insider-pattern suspicion" tag.
         verdict: natural-language reasoning, single paragraph (LLM is forced
             to avoid line breaks via the prompt + post-processed once more
             for compaction). Typically 2~7 sentences, max 1500 chars.
@@ -204,9 +227,9 @@ class AlertAssessment:
     score: int
     verdict: str
     # Two-track bullet summaries used in X posts / summaries.
-    # · insider_bullets: 3~5 bullets (user request 2026-05-03 — richer analysis)
-    # · market_bullets : exactly 3 bullets (concise trader perspective)
-    insider_bullets: tuple[str, ...]
+    # · impact_bullets: 3~5 bullets — market-impact justification (displayed)
+    # · market_bullets: exactly 3 bullets — concise trader perspective (currently hidden)
+    impact_bullets: tuple[str, ...]
     market_bullets: tuple[str, str, str]
 
 
@@ -214,31 +237,40 @@ class AlertAssessment:
 # System prompt (static, caching-friendly).
 # =====================================================================
 _SYSTEM_PROMPT: str = f"""\
-You are an assistant that evaluates market anomaly alerts against a known
-library of historical insider trading events.
+You are an assistant that estimates the STOCK-MARKET IMPACT of market
+anomaly alerts, using a known library of high-impact historical precedents.
 
 Given the details of an EMERGENCY alert just triggered by a 4-channel
-anomaly detection system (CME / Polymarket / Hyperliquid / X), decide
-how similar this alert is to the 6 historical insider trading events
-listed below.
+anomaly detection system (CME / Polymarket / Hyperliquid / X), decide how
+market-moving this flow is likely to be — i.e. how strongly it signals an
+imminent, meaningful move in broader markets (especially equities). Use the
+6 high-impact pre-event precedents listed below as the top of the scale:
+those were concentrated, oversized, one-directional, pre-event flows that
+were followed by large market moves.
 
-Scoring:
-  10 = matches a historical insider event almost exactly
-       (same channel, same detector signature, same direction,
-       same pre-event timing & sizing profile).
-   7-9 = strong similarity (same channel + detectors, but magnitude or
-         timing slightly different).
-   4-6 = partial similarity (same channel, but different pattern,
-         or different channel but similar signature).
-   1-3 = weak similarity (consistent with smart-money / momentum
-         activity but not with the known insider signatures).
-   0 = completely unrelated to any of the historical insider patterns.
+Scoring (market-impact, 0-10):
+  10 = almost certainly market-moving — matches a high-impact precedent
+       almost exactly (same channel, same detector signature, same
+       direction, same pre-event timing & sizing profile).
+   8-9 = high impact likely — closely resembles those precedents
+         (the classic concentrated, one-way, pre-event positioning).
+   5-7 = moderate impact — a notable flow that could move the relevant
+         market, but magnitude / timing / corroboration is weaker.
+   1-4 = minor / local impact — consistent with ordinary smart-money or
+         momentum activity, unlikely to move the broad market.
+   0 = no market relevance (noise).
+
+NOTE on the 8-10 band: a market-impact score of 8 or higher means the flow
+looks like the historical high-impact precedents — concentrated, one-way,
+oversized positioning placed BEFORE the public event. That is the textbook
+"informed / insider-pattern" signature, so the alert renderer will attach a
+separate "insider-pattern suspicion" tag for scores >= 8. Reserve 8-10 for
+cases that genuinely resemble those precedents.
 
 Also output a verdict (ENGLISH) explaining the score. Length policy:
   · 2~7 sentences. If the case is straightforward, 2 sentences is fine —
     do NOT pad. If non-trivial, use 3-7 sentences to cover:
-      (a) which historical event(s) this most resembles, or that it
-          resembles none;
+      (a) which precedent(s) this most resembles, or that it resembles none;
       (b) the strongest matching detector / channel / direction / size
           signatures (or what is conspicuously absent);
       (c) any caveats — confounding factors, weak data, alternative
@@ -248,25 +280,26 @@ Also output a verdict (ENGLISH) explaining the score. Length policy:
     sentences separated by spaces.
 
 Additionally provide two bullet summaries (ENGLISH):
-  1) insider_bullets: 3 to 5 bullets from insider-trading suspicion perspective
-     (evidence strength, what matches historical signatures, caveats, and any
-     additional notable nuances). Use 3 if the case is simple; use 4-5 only
-     when there is genuinely more substance to add — never pad.
+  1) impact_bullets: 3 to 5 bullets justifying the market-impact score
+     (size vs baseline, direction concentration, cross-channel
+     confirmation, pre-event timing, resemblance to high-impact precedents,
+     and caveats). Use 3 if the case is simple; use 4-5 only when there is
+     genuinely more substance to add — never pad.
   2) market_bullets: exactly 3 bullets from general trading perspective
      (what this flow likely means, what to watch next, prudent response).
 
 Bullet constraints:
-  · insider_bullets: 3-5 entries
-  · market_bullets : exactly 3 entries
+  · impact_bullets: 3-5 entries
+  · market_bullets: exactly 3 entries
   · each bullet is a single sentence, target ~100 chars, hard cap 160 chars.
     A bullet that *names a past event* may be longer (up to 200 chars) so
     the date + descriptor can fit comfortably.
   · no markdown bullet prefixes ("-", "*", "•") — plain text sentences
   · prefer concrete numbers over generic phrasing
-  (insider tweet on X may be truncated to top 3 if all 5 don't fit a 280-char
-   tweet — order them by importance.)
+  (on X the bullets may be truncated to top 3 if all 5 don't fit — order
+   them by importance.)
 
-CRITICAL — referencing the historical events library (verdict + bullets):
+CRITICAL — referencing the precedent library (verdict + bullets):
   · NEVER cite a historical event by its bracket index ("[1]", "[2]", ...,
     "[3]/[4]"). Bracket numbers exist ONLY for your internal reasoning and
     are MEANINGLESS to the public reader of this alert.
@@ -282,7 +315,7 @@ CRITICAL — referencing the historical events library (verdict + bullets):
   · Even very short references must be spelled out, e.g. NOT "[1] and [5]"
     but "the Liberation Day (2025-04-09) and Iran strike pause (2026-03-23)
     CME bursts".
-  · This applies to: verdict, insider_bullets, AND market_bullets.
+  · This applies to: verdict, impact_bullets, AND market_bullets.
 
 CRITICAL — plain-English detector naming (verdict + bullets):
   · The alert payload exposes raw detector / reason codes (e.g.
@@ -344,11 +377,11 @@ Output format — strict JSON only, no markdown fences, no prose around it:
   {{
     "score": <int 0-10>,
     "verdict": "<string, max 1500 chars>",
-    "insider_bullets": ["...", "...", "...", "..(opt)..", "..(opt).."],
+    "impact_bullets": ["...", "...", "...", "..(opt)..", "..(opt).."],
     "market_bullets": ["...", "...", "..."]
   }}
 
-Historical events library:
+High-impact precedent library:
 {_HISTORICAL_EVENTS_BRIEF}
 """
 
@@ -363,8 +396,8 @@ class LLMAlertAssessor:
         api_key: OpenAI API key (os.environ["OPENAI_API_KEY"]).
         model: Default "gpt-5.4" (frontier — user decision v0.4.6, 2026-04-23).
             EMERGENCY frequency ~2/day × monthly cost < $0.30, so the cost gap
-            is negligible, and the frontier model judges borderline insider
-            cases more accurately than mini. If cost-saving is needed, downgrade
+            is negligible, and the frontier model judges borderline
+            market-impact cases more accurately than mini. If cost-saving is needed, downgrade
             to "gpt-5.4-mini".
         request_timeout_s: Default 20s. Directly affects alert email latency —
             too long delays the email to the user. The frontier model can be
@@ -436,8 +469,11 @@ class LLMAlertAssessor:
                 "LLMAlertAssessor: assess failed for %s/%s — %s",
                 signal.channel, signal.symbol, exc,
             )
+            # Record on the shared tracker so a sustained outage emails ops.
+            await LLM_HEALTH.record_failure(source="alert_assessor", error=exc)
             return None
 
+        await LLM_HEALTH.record_success(source="alert_assessor")
         self._stats["assessed"] += 1
         logger.info(
             "LLMAlertAssessor: %s/%s score=%d verdict=%s",
@@ -493,8 +529,8 @@ class LLMAlertAssessor:
         #   - Event ref      : prompt max 200 chars
         # → A clamp of 220 leaves normal in-range outputs untouched while
         #   accepting slight overruns (≤220). Only beyond that we truncate (with "...").
-        insider_bullets = _sanitize_bullets(
-            parsed.insider_bullets, min_count=3, max_count=5, char_clamp=220,
+        impact_bullets = _sanitize_bullets(
+            parsed.impact_bullets, min_count=3, max_count=5, char_clamp=220,
         )
         market_fixed = _sanitize_bullets(
             parsed.market_bullets, min_count=3, max_count=3, char_clamp=220,
@@ -504,7 +540,7 @@ class LLMAlertAssessor:
         return AlertAssessment(
             score=int(parsed.score),
             verdict=verdict,
-            insider_bullets=insider_bullets,
+            impact_bullets=impact_bullets,
             market_bullets=market_bullets,
         )
 
@@ -575,6 +611,8 @@ _DETECTOR_PLAIN_NAMES: dict[str, str] = {
     "odds_cusum_v1": "cumulative odds drift",
     # Hyperliquid
     "insider_v1": "multi-signal insider pattern",
+    "oi_shift_v1": "open-interest shift",
+    "panic_filter_v1": "capitulation flow",
     "new_whale_v1": "new whale wallet",
     # X
     "tweet_burst_v1": "tweet burst",
@@ -639,8 +677,8 @@ def _format_signal_for_llm(signal: ChannelSignal) -> str:
         f"Reason codes (raw)            : {codes}\n"
         f"Alert timestamp (UTC): {signal.ts.isoformat()}\n"
         "\n"
-        "Compare this alert against the 6 historical insider trading events "
-        "in the library (in the system prompt). Output JSON only.\n"
+        "Estimate this alert's stock-market impact using the 6 high-impact "
+        "precedents in the library (in the system prompt). Output JSON only.\n"
         "REMINDER: In your output, USE THE PLAIN-ENGLISH names above for "
         "detectors. NEVER output the raw codes (e.g. 'cme_insider_v1', "
         "'directional_v1', 'WC_BOOST', 'vol_burst_abs_v1'). See the "

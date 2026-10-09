@@ -89,6 +89,7 @@ from .renderer.channel_telegram import (
 from .renderer.channel_x_post import render_channel_x_thread
 from .renderer.email_plot import EMAIL_STACK_WINDOWS
 from .renderer.telegram import TelegramConfig
+from .x_api_health import X_API_HEALTH
 from .x_publisher import SentXPost, XCredentials, XPostConfig, send_x_thread
 
 logger = logging.getLogger(__name__)
@@ -196,7 +197,7 @@ class ChannelAlertDispatcher:
             "telegram_errors": 0,
             "x_post_emitted": 0,
             "x_post_skipped_tier": 0,
-            # Passed the EMERGENCY tier gate but the LLM suspicion score
+            # Passed the EMERGENCY tier gate but the LLM market-impact score
             # was below min_score (or llm_assessment was None, so score
             # is unknown). Counted separately for visibility.
             "x_post_skipped_score": 0,
@@ -366,17 +367,25 @@ class ChannelAlertDispatcher:
                         self._stats["telegram_emitted"] += 1
                         result.telegrams.append(tg_capture)
 
-            # ── X auto-post (optional, EMERGENCY + score gate) ──
+            # ── X auto-post (optional, EMERGENCY + per-channel score gate) ──
             # Best-effort, independent of email/telegram.
-            # Gate order:
+            # Gate order (user decision 2026-06-16, per-channel):
             #   1) tier == EMERGENCY passes
-            #   2) LLM insider-trading suspicion score >= min_score passes
-            #      (if llm_assessment is None the score is unknown → skip)
+            #   2) only for score_gated_channels (= polymarket) additionally
+            #      require market-impact score >= min_score (if llm_assessment
+            #      is None the score is unknown → skip). All other channels
+            #      (hyperliquid/cme/x/truth_social) post on EMERGENCY regardless
+            #      of score.
             if self.x_post_enabled:
                 min_score = self._x_post_config.min_score
+                score_gated = (
+                    channel_name in self._x_post_config.score_gated_channels
+                )
                 if sig.tier != Tier.EMERGENCY:
                     self._stats["x_post_skipped_tier"] += 1
-                elif llm_assessment is None or llm_assessment.score < min_score:
+                elif score_gated and (
+                    llm_assessment is None or llm_assessment.score < min_score
+                ):
                     self._stats["x_post_skipped_score"] += 1
                     logger.info(
                         "x_post skipped (low score): channel=%s symbol=%s "
@@ -618,7 +627,12 @@ class ChannelAlertDispatcher:
                 "alert_id=%s — %s",
                 channel_name, sig.symbol, alert_id, exc,
             )
+            await X_API_HEALTH.record_failure(source="x_publisher", error=exc)
             return None
+
+        # Dry-run never calls the X API, so it says nothing about availability.
+        if not sent.dry_run:
+            await X_API_HEALTH.record_success(source="x_publisher")
 
         logger.info(
             "channel_dispatcher: emit X_POST channel=%s symbol=%s tier=%s "

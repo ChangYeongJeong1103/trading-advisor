@@ -49,11 +49,12 @@ _DETECTOR_LABELS: dict[str, str] = {
     "odds_cusum_v1": "cumulative direction shift",
     "directional_v1": "one-way order flow",
     "wallet_concentration_v1": "wallet concentration",
+    "oi_shift_v1": "open-interest shift",
     "insider_v1": "multi-signal insider pattern",
     "cme_insider_v1": "multi-signal insider pattern (CME)",
     "new_whale_v1": "new whale entry",
     "cluster_v1": "distributed whale cluster",
-    "panic_filter_v1": "panic-flow filter",
+    "panic_filter_v1": "capitulation flow",
     "tradingview_webhook": "TradingView trigger",
     "llm_classifier_v1": "LLM narrative classifier",
     "x_corroboration_v1": "X cross-account corroboration",
@@ -112,7 +113,7 @@ _CASHTAG_BY_CME_ROOT: dict[str, str] = {
 # Channel + instrument category → hashtag appended to the body.
 # X spam filters may downrank posts with 3+ hashtags, so allow at most one per
 # channel/instrument.
-# `#Insider` is added separately when LLM score≥7, keeping the total ≤2.
+# `#InsiderPattern` is added separately when market-impact score>=8, keeping ≤2.
 _HASHTAG_PER_CHANNEL: dict[str, str] = {
     "polymarket":   "#PredictionMarkets",
     "hyperliquid":  "#Crypto",
@@ -132,9 +133,48 @@ _HASHTAG_PER_CME_ROOT: dict[str, str] = {
     "ZB": "#Macro",
 }
 
-# LLM suspicion threshold; add #Insider at the end when score is at or above it.
-# User decision: 2026-05-04.
-_INSIDER_HASHTAG_THRESHOLD: int = 7
+# ─────────────────────────────────────────────────────────────────────
+# Market-impact score display + insider-pattern tag (user decision 2026-06-16)
+# ─────────────────────────────────────────────────────────────────────
+# The everyday label is the softer "Market-impact: N/10". Only at the very
+# top band (score >= THRESHOLD) do we add an "insider-pattern suspicion" tag.
+# (Previously the label itself was "Insider-trading suspicion" + #Insider at
+# score>=7.)
+#
+# These constants/helpers are also imported by the email/telegram renderers
+# as a single source of truth.
+INSIDER_PATTERN_TAG_THRESHOLD: int = 8
+INSIDER_PATTERN_TAG_LABEL: str = "insider-pattern suspicion"
+_MARKET_IMPACT_TITLE: str = "Market-impact"
+
+# Channels that should NOT get the insider-pattern tag (user decision 2026-06-16).
+# A truth_social post IS the public catalyst itself, so the insider-pattern tag
+# (which implies covert pre-event positioning) does not fit -> excluded.
+INSIDER_PATTERN_TAG_EXCLUDED_CHANNELS: frozenset[str] = frozenset({
+    CHANNEL_TRUTH_SOCIAL,
+})
+
+
+def shows_insider_pattern_tag(channel: str) -> bool:
+    """Whether to attach the insider-pattern tag/hashtag for this channel."""
+    return channel not in INSIDER_PATTERN_TAG_EXCLUDED_CHANNELS
+
+
+def market_impact_title(score: int, *, show_insider_tag: bool = True) -> str:
+    """score → "Market-impact: N/10" (+ insider-pattern tag when conditions met).
+
+    The tag is added only when score >= INSIDER_PATTERN_TAG_THRESHOLD and
+    show_insider_tag is True (some channels such as truth_social call with False).
+
+    Examples:
+        market_impact_title(6) -> "Market-impact: 6/10"
+        market_impact_title(9) -> "Market-impact: 9/10  ⚠️ insider-pattern suspicion"
+        market_impact_title(9, show_insider_tag=False) -> "Market-impact: 9/10"
+    """
+    base = f"{_MARKET_IMPACT_TITLE}: {score}/10"
+    if show_insider_tag and score >= INSIDER_PATTERN_TAG_THRESHOLD:
+        return f"{base}  \u26a0\ufe0f {INSIDER_PATTERN_TAG_LABEL}"
+    return base
 
 # Channel labels dedicated to X headers, separate from email-subject SHORT aliases.
 # User decision 2026-05-04: POLY/HL are unclear to external readers, so use full
@@ -249,7 +289,7 @@ def render_channel_x_thread(
         Analysis: <one-sentence summary>
         <Imbalance|Concentration>: <legend>          (conditional)
 
-        Insider-trading suspicion: <score>/10
+        Market-impact: <score>/10 [⚠️ insider-pattern suspicion (score>=8)]
         - <bullet 1>
         - <bullet 2>
         - <bullet 3>
@@ -261,10 +301,9 @@ def render_channel_x_thread(
     because this is a single tweet.
 
     NOTE (2026-05-14 change): "Trader's view" used to be posted as well, but it
-    was removed across all channels (X / Email / Telegram) because the
-    insider-suspicion analysis was already sufficient and followers were unlikely
-    to read it. The LLM still generates market_bullets for optionality, but they
-    are not displayed.
+    was removed across all channels (X / Email / Telegram) because the one-line
+    summary was already sufficient and followers were unlikely to read it. The
+    LLM still generates market_bullets for optionality, but they are not displayed.
     """
     _ = cooldown_reason  # Cooldown info has little meaning for external users.
 
@@ -314,14 +353,18 @@ def render_channel_x_thread(
     ))
 
     if llm_assessment is not None:
-        # Show only Insider-trading suspicion (3-5 bullets).
+        # Show the market-impact score + justification bullets (3-5).
+        # When score>=8 the title automatically gets an insider-pattern tag.
         # Per user decision 2026-05-14, market_bullets (Trader's view) are hidden
         # on all channels. See the docstring.
-        insider_block = _format_bullet_section(
-            title=f"Insider-trading suspicion: {llm_assessment.score}/10",
-            bullets=llm_assessment.insider_bullets,
+        impact_block = _format_bullet_section(
+            title=market_impact_title(
+                llm_assessment.score,
+                show_insider_tag=shows_insider_pattern_tag(signal.channel),
+            ),
+            bullets=llm_assessment.impact_bullets,
         )
-        sections.append(insider_block)
+        sections.append(impact_block)
 
     # Hashtag line for FinTwit reach, as its own one-line section.
     hashtag_line = _hashtag_line_for_signal(
@@ -483,15 +526,15 @@ def _hashtag_line_for_signal(
 ) -> str:
     """Build the one-line hashtag suffix for the body, or an empty string.
 
-    Principles (user decision 2026-05-04):
+    Principles (user decision 2026-05-04, threshold updated 2026-06-16):
       · At most one hashtag per channel/instrument to avoid X algorithm spam filters.
-      · Add `#Insider` when LLM suspicion score ≥ 7 → maximum of 2 tags.
+      · Add `#InsiderPattern` when market-impact score ≥ 8 → maximum of 2 tags.
       · If there are 0 tags, omit the hashtag line entirely.
 
     Args:
         channel: signal.channel.
         symbol: signal.symbol.
-        llm_assessment: If present, inspect score. If None, skip #Insider check.
+        llm_assessment: If present, inspect score. If None, skip hashtag check.
     """
     tags: list[str] = []
 
@@ -509,9 +552,14 @@ def _hashtag_line_for_signal(
         if tag:
             tags.append(tag)
 
-    # Add #Insider when LLM suspicion score is at or above the threshold.
-    if llm_assessment is not None and llm_assessment.score >= _INSIDER_HASHTAG_THRESHOLD:
-        tags.append("#Insider")
+    # Add #InsiderPattern when market-impact score is at or above the threshold (8).
+    # Excluded channels (truth_social) never get it.
+    if (
+        llm_assessment is not None
+        and llm_assessment.score >= INSIDER_PATTERN_TAG_THRESHOLD
+        and shows_insider_pattern_tag(channel)
+    ):
+        tags.append("#InsiderPattern")
 
     return " ".join(tags) if tags else ""
 
@@ -537,11 +585,18 @@ def _pretty_topic_slug(slug: str) -> str:
     return " ".join(w[0].upper() + w[1:].lower() for w in words)
 
 
-# Convert key_tickers from the Truth Social LLM ("SPY,QQQ,NVDA,MP") into X
-# cashtag form ("$SPY, $QQQ, $NVDA, $MP") so X auto-hyperlinks them.
+# Convert key_tickers from the Truth Social LLM ("SPY,QQQ,NVDA,MP") into the
+# "Key tickers" line.
+# X rule (found 2026-06-26): a post may contain at most ONE cashtag ($). Two or
+# more are rejected with 403 ("Posts are limited to a maximum of one cashtag").
+# → Render only the first ticker as a $cashtag (X auto-hyperlink + search reach)
+#   and the rest as plain text, keeping the info while obeying X's rule.
 def _format_truth_social_tickers(raw: str) -> str:
     parts = [t.strip().upper() for t in raw.split(",") if t.strip()]
-    return ", ".join(f"${t}" for t in parts)
+    if not parts:
+        return ""
+    # Only the first ticker gets a cashtag; the rest are plain text.
+    return ", ".join([f"${parts[0]}", *parts[1:]])
 
 
 def _pretty_symbol(symbol: str) -> str:
@@ -1129,6 +1184,10 @@ symbol_with_friendly = _symbol_with_friendly
 __all__ = [
     "RenderedXThread",
     "render_channel_x_thread",
+    "market_impact_title",
+    "shows_insider_pattern_tag",
+    "INSIDER_PATTERN_TAG_THRESHOLD",
+    "INSIDER_PATTERN_TAG_LABEL",
     "render_detector_lines",
     "render_analysis",
     "render_footnote",

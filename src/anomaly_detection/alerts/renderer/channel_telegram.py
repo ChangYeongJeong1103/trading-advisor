@@ -72,9 +72,12 @@ from ..format_time import format_pdt
 from ..llm_assessor import AlertAssessment
 from ..subject_template import build_alert_subject
 from .channel_x_post import (
+    INSIDER_PATTERN_TAG_LABEL,
+    INSIDER_PATTERN_TAG_THRESHOLD,
     render_analysis,
     render_detector_lines,
     render_footnote_parts,
+    shows_insider_pattern_tag,
     symbol_with_friendly,
 )
 from .telegram import TelegramConfig
@@ -190,11 +193,12 @@ def _build_caption(
       4) Detectors block (natural language + expression = value) — reuses render_detector_lines().
       5) One-line analysis
       6) One-line scale (only when DIR_IMB / WC are present)
-      7) Insider-trading suspicion (EMERGENCY only, 3-5 bullets) — reuses render_bullet_summary.
+      7) Market-impact score (EMERGENCY only, 3-5 bullets) — adds an
+         insider-pattern tag when score>=8.
       8) alert_id (small, cross-links with email)
 
     Drop priority when 1024 char is exceeded:
-      Trim insider-trading suspicion bullets → Scale → alert_id → hard trim.
+      Trim market-impact bullets → Scale → alert_id → hard trim.
 
     NOTE (changed 2026-05-14): previously also rendered the "Trader's view"
     section, but per user decision the insider analysis alone is sufficient
@@ -246,28 +250,33 @@ def _build_caption(
     if analysis_text:
         parts.append(f"📝 Analysis: {escape(analysis_text)}")
 
-    # 7) LLM Assess: show only Insider-trading suspicion (3-5, variable).
+    # 7) LLM Assess: show only the Market-impact score (3-5, variable).
+    # When score>=8 an insider-pattern tag is appended.
     # Per user decision 2026-05-14, "Trader's view" is omitted on every channel.
-    insider_bullets_full: tuple[str, ...] = ()
+    impact_bullets_full: tuple[str, ...] = ()
     score_emoji = ""
+    impact_tag = ""
     if llm_assessment is not None:
-        if llm_assessment.score >= 7:
+        if llm_assessment.score >= INSIDER_PATTERN_TAG_THRESHOLD:
             score_emoji = "🔴"
-        elif llm_assessment.score >= 4:
+            # Excluded channels (truth_social) never get the insider-pattern tag.
+            if shows_insider_pattern_tag(signal.channel):
+                impact_tag = f" \u26a0\ufe0f {INSIDER_PATTERN_TAG_LABEL}"
+        elif llm_assessment.score >= 5:
             score_emoji = "🟠"
         else:
             score_emoji = "⚪"
-        insider_bullets_full = llm_assessment.insider_bullets
+        impact_bullets_full = llm_assessment.impact_bullets
 
     def _insider_html(n_bullets: int) -> str:
-        """Render the insider block as N bullets (assumes ≥3)."""
-        if llm_assessment is None or not insider_bullets_full:
+        """Render the market-impact block as N bullets (assumes ≥3)."""
+        if llm_assessment is None or not impact_bullets_full:
             return ""
-        bullets = insider_bullets_full[:n_bullets]
+        bullets = impact_bullets_full[:n_bullets]
         block = "\n".join(f"- {escape(b)}" for b in bullets)
         return (
-            f"🤖 Insider-trading suspicion {score_emoji} "
-            f"<b>{llm_assessment.score}/10</b>\n{block}"
+            f"🤖 Market-impact {score_emoji} "
+            f"<b>{llm_assessment.score}/10</b>{escape(impact_tag)}\n{block}"
         )
 
     scale_html = (
@@ -280,7 +289,7 @@ def _build_caption(
         all_parts = parts + [e for e in extras if e]
         return "\n".join(all_parts)
 
-    n_insider_full = len(insider_bullets_full)
+    n_insider_full = len(impact_bullets_full)
 
     # ── Cascade priority (drop order) ────────────────────────────────────
     # 1) Full (insider N + scale + id)
