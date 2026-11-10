@@ -7,8 +7,9 @@ Responsibilities (architecture §2.1, §6.6):
   - Gamma API   (https://gamma-api.polymarket.com/)
       market metadata: slug → {conditionId, lastTradePrice, bestBid/Ask,
       spread, volume24hr, active, closed, outcomes, ...}
-  - Data API    (https://data-api.polymarket.com/)
+  - Data API v2 (https://data-api.polymarket.com/v2/trades)
       recent trades: conditionId → [{wallet, side, size, price, timestamp, ...}]
+      v1 GET /trades returned 410 and was retired on 2026-11-02.
 
   v1 P2 is REST polling first (architecture §3 walking-skeleton). WebSocket
   upgrade arrives in P9 deep-dive. REST alone with 5~10s polling comfortably
@@ -48,12 +49,41 @@ logger = logging.getLogger(__name__)
 GAMMA_BASE_URL: str = "https://gamma-api.polymarket.com"
 DATA_BASE_URL: str = "https://data-api.polymarket.com"
 
+# v2 snake_case names → camelCase keys the channel and normalizer already read.
+# slug, side, size, price, and timestamp kept the same name in v2.
+_V2_FIELD_ALIASES: dict[str, str] = {
+    "proxy_wallet": "proxyWallet",
+    "condition_id": "conditionId",
+    "token_id": "asset",
+}
+
 # Exceptions tenacity retries on — network / 5xx / timeout only. 4xx (bad slug etc.) fails immediately.
 _RETRIABLE_EXC = (
     httpx.TimeoutException,
     httpx.NetworkError,
     httpx.RemoteProtocolError,
 )
+
+
+def alias_v2_trade_fields(trade: dict[str, Any]) -> dict[str, Any]:
+    """Add the v1 camelCase keys onto a v2 trade dict.
+
+    The channel dedupe key and the normalizer read proxyWallet / conditionId.
+    Original v2 keys are kept; only missing camelCase aliases are filled in.
+
+    Args:
+        trade: one element of GET /v2/trades data[].
+
+    Returns:
+        A copy of the trade. Non-dict input is returned unchanged.
+    """
+    if not isinstance(trade, dict):
+        return trade
+    aliased = dict(trade)
+    for new_key, old_key in _V2_FIELD_ALIASES.items():
+        if new_key in aliased and old_key not in aliased:
+            aliased[old_key] = aliased[new_key]
+    return aliased
 
 
 class PolymarketCollector:
@@ -160,15 +190,28 @@ class PolymarketCollector:
 
         Returns:
             list[dict]: newest trade first. Empty list when none.
+            Each dict has both the v2 fields and the camelCase aliases
+            the rest of the channel reads.
         """
-        params = {"market": condition_id, "limit": str(int(limit))}
-        data = await self._get_json("/trades", base=DATA_BASE_URL, params=params)
+        # v1 used ?market=. v2 takes conditionId (an alias of condition).
+        params = {"conditionId": condition_id, "limit": str(int(limit))}
+        payload = await self._get_json("/v2/trades", base=DATA_BASE_URL, params=params)
 
-        if not isinstance(data, list):
-            logger.warning("PolymarketCollector: unexpected trades payload type=%s",
-                           type(data).__name__)
+        # v2 wraps the list: {"data": [...], "pagination": {...}}.
+        if not isinstance(payload, dict):
+            logger.warning(
+                "PolymarketCollector: unexpected trades payload type=%s",
+                type(payload).__name__,
+            )
             return []
-        return data
+        trades = payload.get("data")
+        if not isinstance(trades, list):
+            logger.warning(
+                "PolymarketCollector: trades payload missing data list (keys=%s)",
+                list(payload.keys())[:8],
+            )
+            return []
+        return [alias_v2_trade_fields(trade) for trade in trades]
 
     # ─────────────────────────────────────────────────────────────────
     # Internal — HTTP GET with retry (tenacity exponential backoff)

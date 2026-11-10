@@ -15,10 +15,10 @@ Why use this instead of Dune:
 
   · The Polymarket native Data API:
       - Public (no API key required, generous rate limit)
-      - Paginates 1000 trades at a time (offset-based)
+      - 1000 trades per page, next page via cursor (v1 offset retired 2026-11-02)
       - Sorted newest-first — we paginate until each page's oldest ts goes
         below fetch_start
-      - Server-side time filter is not supported → filter client-side
+      - start/end are sent, and the response is filtered client-side again
 
   · Result: zero cost, zero extra env vars, simpler implementation than Dune.
 
@@ -60,7 +60,10 @@ import httpx
 import pandas as pd
 
 # --- local: production polymarket layer (Gamma) ---
-from ...channels.polymarket.collector import PolymarketCollector
+from ...channels.polymarket.collector import (
+    PolymarketCollector,
+    alias_v2_trade_fields,
+)
 from ...core.schemas import CHANNEL_POLYMARKET
 
 # --- local: replay schemas ---
@@ -357,23 +360,18 @@ class PolymarketDataApiSource:
         fetch_start: datetime,
         fetch_end: datetime,
     ) -> pd.DataFrame:
-        """Paginate the Data API's GET /trades by offset.
+        """Paginate Data API v2 GET /v2/trades with a cursor.
 
         API response:
-            list[dict] — newest first.
-            Each trade: timestamp(int sec), price(float 0..1), size(shares),
-            side("BUY"/"SELL"), proxyWallet, conditionId, outcome, etc.
+            {"data": [trade, ...], "pagination": {"next_cursor": ...}}
+            Newest first.
+            Each trade: timestamp, price, size, side, proxy_wallet, condition_id.
+            alias_v2_trade_fields adds proxyWallet / conditionId before storage.
 
         Strategy:
-            Start from page 0 → stop once the oldest trade ts in a page is
-            **before** fetch_start. After that filter client-side to
-            [fetch_start, fetch_end).
-
-            Edge case: market started trading before fetch_start → the last
-            page's oldest_ts is before fetch_start → break.
-            Conversely, market remained active after fetch_end → the first
-            trade of a page is after fetch_end → those trades are dropped by
-            the client filter.
+            The first request sends start/end. Later pages send only next_cursor.
+            Stop when a page reaches before the window start, or the cursor ends.
+            A short page can still have a next cursor, so do not stop on length.
         """
         assert self._http is not None  # only called from inside warmup.
 
@@ -381,56 +379,44 @@ class PolymarketDataApiSource:
         end_unix = int(fetch_end.timestamp())
 
         rows: list[dict[str, Any]] = []
-        # Known Polymarket Data API constraint: offsets beyond a certain value
-        # (~4000 observed) return 400 Bad Request. The exact cap is undocumented.
-        # On 400 we do not throw — we break and proceed with what we have so far
-        # (i.e. the most recent N trades).
-        # P10.4: needed to handle the high-volume Iran market ($89M).
-        truncated_by_api = False
+        cursor: str | None = None
         for page in range(_MAX_PAGES):
-            offset = page * _PAGE_SIZE
-            try:
-                r = await self._http.get(
-                    "/trades",
-                    params={
-                        "market": condition_id,
-                        "limit": _PAGE_SIZE,
-                        "offset": offset,
-                    },
-                )
-                r.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 400:
-                    # API rejected the offset — proceed with partial data.
-                    logger.warning(
-                        "PolymarketDataApiSource: API offset cap reached "
-                        "at page=%d offset=%d (cid=%s) — proceeding with "
-                        "%d trades collected so far.",
-                        page, offset, condition_id, len(rows),
-                    )
-                    truncated_by_api = True
-                    break
-                raise
+            # The cursor already carries page size and position, so later
+            # pages do not resend limit/start/end.
+            if cursor is None:
+                params: dict[str, Any] = {
+                    "conditionId": condition_id,
+                    "limit": _PAGE_SIZE,
+                    "start": start_unix,
+                    "end": end_unix,
+                }
+            else:
+                params = {"conditionId": condition_id, "cursor": cursor}
 
-            batch = r.json()
+            r = await self._http.get("/v2/trades", params=params)
+            r.raise_for_status()
+
+            body = r.json()
+            batch = body.get("data") if isinstance(body, dict) else None
             if not isinstance(batch, list) or not batch:
                 break
 
-            rows.extend(batch)
+            rows.extend(alias_v2_trade_fields(trade) for trade in batch)
 
             # newest-first → the last row of a batch is the oldest.
             oldest_ts = int(batch[-1].get("timestamp", 0))
             logger.debug(
-                "PolymarketDataApiSource: page=%d offset=%d batch_rows=%d "
+                "PolymarketDataApiSource: page=%d batch_rows=%d "
                 "oldest_ts=%d (need >= %d)",
-                page, offset, len(batch), oldest_ts, start_unix,
+                page, len(batch), oldest_ts, start_unix,
             )
 
             if oldest_ts <= start_unix:
                 # Reached before the window start → stop.
                 break
 
-            if len(batch) < _PAGE_SIZE:
+            cursor = (body.get("pagination") or {}).get("next_cursor")
+            if not cursor:
                 break
 
             await asyncio.sleep(0.2)
@@ -440,21 +426,6 @@ class PolymarketDataApiSource:
                 "— window may be incomplete (start-ts coverage may be insufficient).",
                 _MAX_PAGES, condition_id,
             )
-
-        if truncated_by_api and rows:
-            # If the oldest ts in the partial data is before fetch_start, OK;
-            # otherwise the oldest trade is still inside our window → the front
-            # of the window is missing (= warmup baseline may be insufficient).
-            # Warn only.
-            oldest_collected = int(rows[-1].get("timestamp", 0))
-            if oldest_collected > start_unix:
-                hours_short = (oldest_collected - start_unix) / 3600.0
-                logger.warning(
-                    "PolymarketDataApiSource: API truncation — oldest trade "
-                    "in collected data is %.1f h after window start. "
-                    "Pre-event baseline may be incomplete.",
-                    hours_short,
-                )
 
         if not rows:
             return pd.DataFrame()

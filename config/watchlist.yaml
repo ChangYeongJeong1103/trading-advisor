@@ -13,16 +13,19 @@
 # (the <slug> in polymarket.com/market/<slug>)
 # ─────────────────────────────────────────────────────────────────────
 polymarket_markets:
-  # ── geopolitical / Iran · oil — short-term (October 31 expiry) ──
-  - "strait-of-hormuz-traffic-returns-to-normal-by-october-31-20260810151043583" # ~$165k/24h, direct oil exposure
-  - "us-x-iran-ceasefire-continues-through-october-31-20260917"                  # ~$79k/24h, U.S.–Iran ceasefire durability
-  - "us-announces-end-of-iranian-blockade-by-october-31-2026-20260727171711632-895-372-622-413-171-454-592-696" # ~$177k/24h, end of U.S. blockade
+  # ── geopolitical / Iran · oil — short-term (November 30 expiry) ──
+  - "us-x-iran-ceasefire-continues-through-november-30-20260918"                 # ~$27k/24h, U.S.–Iran ceasefire durability (YES ~40%)
+  - "us-announces-end-of-iranian-blockade-by-november-30-2026"                   # ~$272k/24h, end of U.S. blockade
+
+  # ── geopolitical / Iran · oil — December 31 expiry ──
+  # The November 30 Hormuz market is thin (~$16k/24h), so the December 31 market is used instead.
+  - "strait-of-hormuz-traffic-returns-to-normal-by-december-31"                  # ~$75k/24h, direct oil exposure
 
   # ── geopolitical / Iran — long-term baseline ──
-  - "will-the-us-invade-iran-before-2027"                       # ~$197k/24h, long-term military-escalation gauge
+  - "will-the-us-invade-iran-before-2027"                       # ~$125k/24h, long-term military-escalation gauge
 
-  # ── macro / Fed — October FOMC (Oct 28 meeting) ──
-  - "will-the-fed-increase-interest-rates-by-25-bps-after-the-october-2026-meeting-20260617190324032" # ~$211k/24h
+  # ── macro / Fed — December FOMC (Dec 9 meeting; no FOMC in November) ──
+  - "will-the-fed-increase-interest-rates-by-25-bps-after-the-december-2026-meeting-20260729232808636" # ~$499k/24h
 
   # NOTE: expired slugs are silently skipped by the daemon (logging.debug).
   #       Edit this watchlist freely → restart the daemon to apply
